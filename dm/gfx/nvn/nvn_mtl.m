@@ -2298,7 +2298,7 @@ static int obj_is_tex(id o) {
     int a = [o conformsToProtocol:@protocol(MTLTexture)]; unsigned k = nx++ % NC; ans[k] = (int8_t)a; cls[k] = c;
     return a;
 }
-static int g_red_once[160];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[161];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -5277,7 +5277,19 @@ static NSUInteger att_layers(MTLRenderPassAttachmentDescriptor *a, const view_t 
     return MAX(n, 1u);
 }
 static void rtd_pre(const tex_t *t);
+// The Metal texture whose last render pass attached it through an sRGB view (attach), so the hardware encoded what the shaders wrote: the present's texture there was written
+// from linear values. Frame generation's scene before the UI (fg_scene_take) is linear, as the last pass reads it, and is encoded the same way to match the presented bytes.
+// Ocarina of Time draws its UI into the RG11B10 float output of its upscaler, and its last pass writes that into the RGBA8 window texture through an RGBA8_SRGB view
+static void *g_rt_srgb_base;
+static int mtl_fmt_srgb8(MTLPixelFormat f) { return f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB; }
+static void attach_(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v);
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
+    attach_(a, t, v, has_v);
+    id<MTLTexture> at = a.texture; if (!at) return;
+    id<MTLTexture> base = at.parentTexture ? at.parentTexture : at; void *b = (__bridge void *)base;
+    if (mtl_fmt_srgb8(at.pixelFormat)) g_rt_srgb_base = b; else if (g_rt_srgb_base == b) g_rt_srgb_base = NULL;
+}
+static void attach_(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
     rtd_pre(t); id<MTLTexture> base = tex_mtl(t); sparse_gpu_wrote(t);
     // A texture made without render-target use (packaged or CPU-written, uploaded from its storage) drawn into: give it that use, as a clear of one does (clear_tex). Metal's validation
     // stops at such an attachment; without it Tears of the Kingdom drew its terrain normal maps into textures made for reading only
@@ -13215,6 +13227,7 @@ static id<MTL4ComputeCommandEncoder> dispatch_enc(int game) {   // game: one of 
 }
 static int up_mfx_named(NvShader *cs);
 static int up_mfx_on(void);
+static void up_scene_after(NvShader *cs);
 // An upscaler that is a chain of shaders (profile upscaler_chain "<stage>,...><last>"; Ocarina of Time: agl_ndsr_vr's feature pass at 1/4 size, its network and its blend at the
 // input size, then agl_ndsr_vr_light's scale to the output). With DM_UPSCALER=metalfx the stages are skipped, the first one's colour input is kept, and the last one's dispatch is
 // MetalFX's spatial scaler from that colour into the last one's image (up_mfx_encode). Once the last one is refused, the chain's shaders run again from the next frame on
@@ -13341,6 +13354,7 @@ static void dispatch(const p_dispatch *dp) {
         gpcs_stamp(ce, 0, cs->key, 0); enc_c_dispatch_indirect(ce, ig, MTLSizeMake(tg[0], tg[1], tg[2])); gpcs_stamp(ce, 1, NULL, 0);
     } else { gpcs_stamp(ce, 0, cs->key, (uint32_t)dp->x * dp->y * dp->z); enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2])); gpcs_stamp(ce, 1, NULL, 0); }
     if (own) enc_c_end(ce);
+    if (DM_GAME_UPSCALER_N) up_scene_after(cs);   // the game's own upscaler ran: frame generation's scene before the UI
 }
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, layer stride from SetCopyImageStride, 0 = tightly packed)
 // A copy at a level the host texture lacks (more levels declared than its size holds, tex_desc) is skipped: Metal does not check the level of a blit
@@ -14982,6 +14996,7 @@ static int up_mfx_rect(const uint32_t v[4], NSUInteger w, NSUInteger h, NVNcopyR
     if (v[0] > INT_MAX || v[1] > INT_MAX || rw > INT_MAX || rh > INT_MAX || (uint64_t)v[0] + rw > w || (uint64_t)v[1] + rh > h) return 0;
     *r = (NVNcopyRegion){(int)v[0], (int)v[1], 0, (int)rw, (int)rh, 1}; return 1;
 }
+id<MTLTexture> fg_scene_target(NSUInteger w, NSUInteger h, MTLPixelFormat f);
 // The dispatch of upscaler cs as MetalFX's spatial scaler from its texture slot's rectangle to its image slot's (see above): 1 when drawn, 0 to run the shader
 static int up_mfx_encode(NvShader *cs) {
     int ti = -1, oi = -1;
@@ -15024,9 +15039,19 @@ static int up_mfx_encode(NvShader *cs) {
     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
     [ce endEncoding];
     NSUInteger cw = (NSUInteger)ir.width, ch = (NSUInteger)ir.height;
+    // Frame generation: the scaled scene, before the game draws its UI over it, for the interpolator (fg_scene_target). The result is the output rectangle's size at its origin
+    id<MTLTexture> scn = fg_scene_target((NSUInteger)orr.width, (NSUInteger)orr.height, result.pixelFormat);
+    NSUInteger ow = (NSUInteger)orr.width, oh = (NSUInteger)orr.height;
     rec_cb_block(g_cb, ^(id<MTL4CommandBuffer> cb) {   // the real command buffer, on the encoding thread when it runs (iOS's default)
         sc.colorTexture = color; sc.outputTexture = result; sc.inputContentWidth = cw; sc.inputContentHeight = ch;
         [sc encodeToCommandBuffer:cb];
+        if (scn) {
+            id<MTL4ComputeCommandEncoder> c = [cb computeCommandEncoder];
+            [c barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the scaler's encoders
+            [c copyFromTexture:result sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(ow, oh, 1) toTexture:scn destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [c barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+            [c endEncoding];
+        }
     });
     g_last_end_relaxed = 0;   // the next pass waits for the scaler whole (enc_r_begin_pass)
     if (!direct && !copy_t2t_draw(e->read, out, 0, 0, 0, 0, &at0o, &orr, 0, 0)) {
@@ -15037,6 +15062,34 @@ static int up_mfx_encode(NvShader *cs) {
                             (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height,
                             (unsigned long)out.pixelFormat, direct ? ", straight" : srgb ? ", through RGBA16F, decoded from sRGB" : ", through RGBA16F");
     return 1;
+}
+// After a dispatch of the game's own upscaler (DM_UPSCALER=game): the image its last stage wrote, the scene before the UI, copied for frame generation as up_mfx_encode copies
+// MetalFX's (fg_scene_target). The last stage of a chain (upscaler_chain), else any of the profile's upscaler shaders; its output rectangle is in the same push constants
+static void up_scene_after(NvShader *cs) {
+    static const char *chain = DM_GAME_UPSCALER_CHAIN;
+    if (!cs->key[0] || !(*chain ? up_chain_role(cs) == 3 : up_mfx_named(cs))) return;
+    int oi = -1;
+    for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == NVN_RB_IMG) { if (oi >= 0) return; oi = i; }   // one image: the output
+    if (oi < 0 || cs->rf.b[oi].reg >= 32) return;
+    int tout = (int)(S.img[5][cs->rf.b[oi].reg] & 0xfffff); uint64_t rid = 0; int real = 0; id<MTLTexture> out = nil;
+    os_unfair_lock_lock(&g_rmu);
+    if (tout > 0 && tout < g_ntreg && g_treg[tout].ok) out = img_binding(tout, &cs->rf.b[oi], &rid, &real);
+    os_unfair_lock_unlock(&g_rmu);
+    uint32_t v[8]; memcpy(v, S.push[1], sizeof v); NVNcopyRegion orr;
+    if (!out || !real || out.textureType != MTLTextureType2D || out.sampleCount != 1 || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !up_mfx_rect(v + 4, out.width, out.height, &orr)) return;
+    id<MTLTexture> scn = fg_scene_target((NSUInteger)orr.width, (NSUInteger)orr.height, out.pixelFormat);
+    if (!scn) return;
+    { static int once; if (!once++) MLOG("frame generation: the scene before the UI taken from the game's own upscaler %s, %dx%d at %d,%d of %lux%lu", cs->key, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height); }
+    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    NSUInteger x = (NSUInteger)orr.xoffset, y = (NSUInteger)orr.yoffset, w = (NSUInteger)orr.width, h = (NSUInteger)orr.height;
+    rec_cb_block(g_cb, ^(id<MTL4CommandBuffer> cb) {
+        id<MTL4ComputeCommandEncoder> c = [cb computeCommandEncoder];
+        [c barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the upscaler's dispatch
+        [c copyFromTexture:out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1) toTexture:scn destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [c barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the UI drawn over the image after this
+        [c endEncoding];
+    });
+    g_last_end_relaxed = 0; args_dirty_all();
 }
 // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
 // (fx: the scaler state to use, nil = bilinear). uvb: the pass's crop constants (one buffer per present allocator, written by the CPU)
@@ -15584,7 +15637,8 @@ extern _Atomic uint64_t dm_present_ns;   // hle_thread.c (DM_HITCH_DUMP); the NV
 // old: the slot's texture before the presented size or format last changed, resident until the slot's next use (snap_take)
 // gen / gen_old / gen_serial: the frame generated between the slot's present and the one before (frame generation, below), gen_ok when it holds one; seq: the slot's present
 // in the order of all presents (fg_seq), for whether two slots hold consecutive presents
-static struct { id<MTLTexture> tex, old, gen, gen_old, lum, lum_old; uint64_t serial, gen_serial, seq; int gen_ok; _Atomic uint64_t ticket, ev; } g_snap[SNAP_MAX];   // lum: frame generation's 1/8 luma of tex (fg_luma)
+static struct { id<MTLTexture> tex, old, gen, gen_old, lum, lum_old, scene, scene_old, scene_enc; id<MTLBuffer> uin; uint64_t serial, gen_serial, seq; int gen_ok, scene_ok, ui_counted; _Atomic uint64_t ticket, ev; } g_snap[SNAP_MAX];
+// lum: frame generation's 1/8 luma of tex, or of scene when it has one (fg_luma); scene: the present's picture before its UI, as tex is copied (fg_scene_take); uin: fg_ui's counts
 static id<MTL4CommandAllocator> g_snap_alloc[SNAP_MAX]; static id<MTL4CommandBuffer> g_snap_cb[SNAP_MAX];
 static id<MTLResidencySet> g_snap_res; static id<MTLSharedEvent> g_snap_ev; static uint64_t g_snap_v;
 static _Atomic uint64_t g_snap_next, g_snap_cmt;   // g_snap_cmt: the last copy the encode thread has committed (its g_snap_v)
@@ -15616,21 +15670,21 @@ static int fg_on(void) {
     return g_fg_mode = v;
 }
 // DM_FRAMEGEN_MV (default 1): frame generation's motion from the presented pictures (fg_motion) and the still HUD kept (fg_keep); 0: no motion, as X6-X9
-static id<MTLComputePipelineState> g_fgmv_ps[6]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
-enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_STILL, FGMV_HUD, FGMV_KEEP };
+static id<MTLComputePipelineState> g_fgmv_ps[7]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
+enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_UI };
 static int fg_mv_on(void) {
     if (g_fgmv_ok >= 0) return g_fgmv_ok;
     const char *e = getenv("DM_FRAMEGEN_MV");
     if (e && atoi(e) <= 0) { MLOG("frame generation: no motion given to the interpolator (DM_FRAMEGEN_MV=0): its own flow finds it, up to about 64 px a frame"); return g_fgmv_ok = 0; }
     NSError *err = nil; id<MTLLibrary> lib = host_lib("fgmv", &err);
-    static const char *fn[6] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_still", "fgmv_hud", "fgmv_keep"};
-    for (int i = 0; i < 6; i++) {
+    static const char *fn[7] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_ui"};
+    for (int i = 0; i < 7; i++) {
         id<MTLFunction> f = lib ? [lib newFunctionWithName:@(fn[i])] : nil;
         g_fgmv_ps[i] = f ? [g_dev newComputePipelineStateWithFunction:f error:&err] : nil;
         if (!g_fgmv_ps[i]) { MLOG("[RED] frame generation: no %s pipeline (%s): the interpolator gets no motion, as X6-X9", fn[i], err.description.UTF8String); return g_fgmv_ok = 0; }
     }
     if (g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup < 256) { MLOG("[RED] frame generation: the motion search needs 256 threads a group, this GPU gives %lu: no motion given", (unsigned long)g_fgmv_ps[FGMV_SEARCH].maxTotalThreadsPerThreadgroup); return g_fgmv_ok = 0; }
-    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 4;
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 4; ad.maxBufferBindCount = 1;   // the buffer: fg_ui's counts
     g_fgmv_args = [g_dev newArgumentTableWithDescriptor:ad error:&err];
     if (!g_fgmv_args) { MLOG("[RED] frame generation: no argument table for the motion (%s): no motion given", err.description.UTF8String); return g_fgmv_ok = 0; }
     MLOG("frame generation: motion found from the presented pictures (DM_FRAMEGEN_MV=1: 64 px tiles searched within 192 px at 1/8 size), the still HUD kept from the present");
@@ -15732,18 +15786,20 @@ static int fg_shown_size(NSUInteger cw, NSUInteger ch, NSUInteger *tw, NSUIntege
     if (!(s < 0.95) || s < 0.25) return 0;
     *tw = MAX((NSUInteger)lround(cw * s), 16); *th = MAX((NSUInteger)lround(ch * s), 16); return 1;
 }
-static id<MTLRenderPipelineState> g_fg_scale_pso; static MTLPixelFormat g_fg_scale_fmt; static id<MTL4ArgumentTable> g_fg_args; static id<MTLSamplerState> g_fg_samp;
-static id<MTLBuffer> g_fg_uv[SNAP_MAX];   // per ring slot: the present shader's rectangle (a slot is reused only once its copy has run, snap_take)
+static id<MTL4ArgumentTable> g_fg_args; static id<MTLSamplerState> g_fg_samp;
+static id<MTLRenderPipelineState> g_fg_scale_pso_[2]; static MTLPixelFormat g_fg_scale_fmt_[2];   // [1]: the scene's, which can be drawn through an sRGB view (fg_scene_take)
+static id<MTLBuffer> g_fg_uv[2][SNAP_MAX];   // per ring slot: the present shader's rectangle (a slot is reused only once its copy has run, snap_take); [1]: its scene's (fg_scene_take)
 // src's rectangle r (x, y, w, h) drawn into ring slot k's whole dst, which is smaller, with the present's shader and linear filtering, in place of the snapshot's copy
-// (fg_shown_size); 0 when it cannot be
-static int fg_scale(id<MTL4CommandBuffer> cb, int k, id<MTLTexture> src, id<MTLTexture> dst, const NSUInteger r[4]) {
+// (fg_shown_size); 0 when it cannot be. u: which of the slot's rectangle buffers (0 the picture, 1 its scene: both are drawn in one command buffer)
+static int fg_scale(id<MTL4CommandBuffer> cb, int k, int u, id<MTLTexture> src, id<MTLTexture> dst, const NSUInteger r[4]) {
     NSError *e = nil;
-    if (!g_fg_scale_pso || g_fg_scale_fmt != dst.pixelFormat) {
+    __strong id<MTLRenderPipelineState> *pso = &g_fg_scale_pso_[u ? 1 : 0]; MTLPixelFormat *pfmt = &g_fg_scale_fmt_[u ? 1 : 0];
+    if (!*pso || *pfmt != dst.pixelFormat) {
         id<MTLLibrary> lib = host_lib("present", &e);
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"]; pd.colorAttachments[0].pixelFormat = dst.pixelFormat;
-        g_fg_scale_pso = lib ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&e] : nil; g_fg_scale_fmt = dst.pixelFormat;
-        if (!g_fg_scale_pso) { RED_ONCE(158, "frame generation: no pipeline to copy the picture at its shown size (format %lu): %s", (unsigned long)dst.pixelFormat, e.description.UTF8String); return 0; }
+        *pso = lib ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&e] : nil; *pfmt = dst.pixelFormat;
+        if (!*pso) { RED_ONCE(158, "frame generation: no pipeline to copy the picture at its shown size (format %lu): %s", (unsigned long)dst.pixelFormat, e.description.UTF8String); return 0; }
     }
     if (!g_fg_args) {
         MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1; ad.maxBufferBindCount = 1;
@@ -15752,8 +15808,9 @@ static int fg_scale(id<MTL4CommandBuffer> cb, int k, id<MTLTexture> src, id<MTLT
         g_fg_samp = [g_dev newSamplerStateWithDescriptor:sd];
         if (!g_fg_args || !g_fg_samp) { RED_ONCE(158, "frame generation: no argument table to copy the picture at its shown size"); g_fg_args = nil; return 0; }
     }
-    if (!g_fg_uv[k]) { g_fg_uv[k] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; if (!g_fg_uv[k]) return 0; [g_snap_res addAllocation:g_fg_uv[k]]; [g_snap_res commit]; }
-    float *uv = g_fg_uv[k].contents; float w = (float)src.width, h = (float)src.height;
+    id<MTLBuffer> ub = g_fg_uv[u][k];
+    if (!ub) { ub = g_fg_uv[u][k] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; if (!ub) return 0; [g_snap_res addAllocation:ub]; [g_snap_res commit]; }
+    float *uv = ub.contents; float w = (float)src.width, h = (float)src.height;
     uv[0] = r[0] / w; uv[1] = r[1] / h; uv[2] = r[2] / w; uv[3] = r[3] / h;   // as present_encode_m4's crop constants
     uv[4] = (r[0] + 0.5f) / w; uv[5] = (r[1] + 0.5f) / h; uv[6] = (r[0] + r[2] - 0.5f) / w; uv[7] = (r[1] + r[3] - 0.5f) / h;
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
@@ -15762,8 +15819,8 @@ static int fg_scale(id<MTL4CommandBuffer> cb, int k, id<MTLTexture> src, id<MTLT
     if (!en) { RED_ONCE(158, "frame generation: no render encoder to copy the picture at its shown size"); return 0; }
     [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:resource_vis()];   // after the frame's work and the slot's last present
     [en setArgumentTable:g_fg_args atStages:MTLRenderStageFragment];
-    [g_fg_args setTexture:src.gpuResourceID atIndex:0]; [g_fg_args setSamplerState:g_fg_samp.gpuResourceID atIndex:0]; [g_fg_args setAddress:g_fg_uv[k].gpuAddress atIndex:0];
-    [en setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}]; [en setRenderPipelineState:g_fg_scale_pso];
+    [g_fg_args setTexture:src.gpuResourceID atIndex:0]; [g_fg_args setSamplerState:g_fg_samp.gpuResourceID atIndex:0]; [g_fg_args setAddress:ub.gpuAddress atIndex:0];
+    [en setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}]; [en setRenderPipelineState:*pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [en barrierAfterStages:MTLStageFragment beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next writes to its texture come after this read
     [en endEncoding];
@@ -15785,10 +15842,112 @@ static void fg_gpu_note(double s) {
     }
     pthread_mutex_unlock(&mu);
 }
+// ---------- Frame generation from the scene before its UI ----------
+// The still HUD kept by fg_keep holds only where a pixel stayed the same between two presents: the anti-aliased edges and see-through parts of a HUD over a moving background
+// (hearts, the map, the buttons' icons) and a HUD that changes (a counter) are left to the interpolator, which drags them with the motion around them, and a HUD also misleads
+// the motion search. A game that draws its UI over its upscaled scene hands the host that scene where the host draws its upscaler (up_mfx_encode, DM_UPSCALER=metalfx; Ocarina of
+// Time's agl chain): there it is copied (fg_scene_target), each present's snapshot takes it as the picture is taken (fg_scene_take, the same rectangle and scale), the interpolator
+// and the motion search get the scene alone, and fg_ui puts the present's UI over the result, found exactly by where the present differs from its scene.
+// Checked as it runs: on a 4x4 grid fg_ui counts the pixels the UI changed by more than 8/255. A HUD covers a small part of the picture; a scene that is not the present without
+// its UI (post-processing after the upscaler, a frame ahead or behind) differs nearly everywhere, and after FG_SCENE_BAD such presents in a row the scene is no longer used and
+// the HUD is kept by stillness again (fg_keep). DM_FRAMEGEN_SCENE=0 leaves it out
+#define FG_SCENE_BAD 60
+static id<MTLTexture> g_fg_scene_pend, g_fg_scene_pend_old, g_fg_gscene;   // the last scene copied (submit thread); the interpolated scene fg_ui reads
+static _Atomic int g_fg_scene_fresh;   // a scene was copied since the last snapshot
+static int g_fg_scene_off = -1, g_fg_scene_badrun, g_fg_scene_mode = -1;
+static uint64_t g_fg_scene_frames, g_fg_scene_cov_n; static double g_fg_scene_cov, g_fg_scene_cov_max;
+static int fg_scene_on(void) {
+    if (g_fg_scene_off < 0) { const char *e = getenv("DM_FRAMEGEN_SCENE"); g_fg_scene_off = e && atoi(e) <= 0;
+        if (g_fg_scene_off) MLOG("frame generation: the scene before the UI is not used (DM_FRAMEGEN_SCENE=0): the HUD is kept by stillness"); }
+    return !g_fg_scene_off && fg_on() && fg_mv_on();
+}
+// up_mfx_encode, on the submit thread: the texture its w x h result (format f, at the origin) is copied into after the scaler, nil when frame generation does not use it
+id<MTLTexture> fg_scene_target(NSUInteger w, NSUInteger h, MTLPixelFormat f) {
+    if (!fg_scene_on()) return nil;
+    id<MTLTexture> t = g_fg_scene_pend;
+    if (!t || t.width != w || t.height != h || t.pixelFormat != f) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:w height:h mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+        if (!(t = [g_dev newTextureWithDescriptor:d])) { RED_ONCE(160, "frame generation: no texture for the scene before the UI"); return nil; }
+        t.label = @"frame generation scene";
+        // The one replaced stays resident for a snapshot still on the GPU (sizes change rarely: the upscaler's output is the game's output size)
+        if (g_fg_scene_pend_old) res_remove(g_fg_scene_pend_old);
+        g_fg_scene_pend_old = g_fg_scene_pend; res_add(t); res_commit(); g_fg_scene_pend = t;
+        MLOG("frame generation: the scene before the UI copied from the upscaler, %lux%lu format %lu", (unsigned long)w, (unsigned long)h, (unsigned long)f);
+    }
+    atomic_store(&g_fg_scene_fresh, 1);
+    return t;
+}
+// snap_take, after slot k's picture was taken from rectangle r of the presented texture into dst: the scene copied since the last present, through the same rectangle and
+// scale, into the slot's scene; sets g_snap[k].scene_ok
+static void fg_scene_take(id<MTL4CommandBuffer> cb, int k, const NSUInteger r[4], id<MTLTexture> dst, int enc) {
+    g_snap[k].scene_ok = 0;
+    id<MTLTexture> sc = g_fg_scene_pend;
+    if (!atomic_exchange(&g_fg_scene_fresh, 0) || !sc || !fg_scene_on() || !fg_keep_fmt(dst.pixelFormat)) return;
+    if (sc.width != r[2] || sc.height != r[3]) {   // not the presented rectangle: another picture, or the UI drawn at another size
+        static NSUInteger last[4]; NSUInteger key[4] = {sc.width, sc.height, r[2], r[3]};
+        if (memcmp(last, key, sizeof key)) { memcpy(last, key, sizeof key);
+            MLOG("frame generation: the scene before the UI is %lux%lu, the presented picture %lux%lu: not used for it", (unsigned long)sc.width, (unsigned long)sc.height, (unsigned long)r[2], (unsigned long)r[3]); }
+        return;
+    }
+    id<MTLTexture> t = g_snap[k].scene;
+    if (!t || t.width != dst.width || t.height != dst.height || t.pixelFormat != dst.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dst.pixelFormat width:dst.width height:dst.height mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+        g_snap[k].scene_old = t; g_snap[k].scene_enc = nil;   // resident until the slot's next use (snap_take)
+        if (!(t = [g_dev newTextureWithDescriptor:d])) { g_snap[k].scene = nil; RED_ONCE(160, "frame generation: no texture for the scene before the UI"); return; }
+        [g_snap_res addAllocation:t]; [g_snap_res commit]; g_snap[k].scene = t;
+    }
+    // The present's texture was last written through an sRGB view (g_rt_srgb_base): the scene, linear, drawn through the slot scene's sRGB view, so it is encoded as the presented bytes were
+    MTLPixelFormat ef = t.pixelFormat == MTLPixelFormatRGBA8Unorm ? MTLPixelFormatRGBA8Unorm_sRGB : t.pixelFormat == MTLPixelFormatBGRA8Unorm ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatInvalid;
+    id<MTLTexture> into = t;
+    if (enc && ef != MTLPixelFormatInvalid) {
+        if (!g_snap[k].scene_enc) g_snap[k].scene_enc = [t newTextureViewWithPixelFormat:ef];
+        if (g_snap[k].scene_enc) into = g_snap[k].scene_enc; else RED_ONCE(160, "frame generation: no sRGB view of the scene before the UI");
+    }
+    static int lenc = -1; if (lenc != (into != t)) { lenc = into != t;
+        MLOG("frame generation: the scene before the UI (format %lu) drawn into the picture's format %lu%s", (unsigned long)sc.pixelFormat, (unsigned long)into.pixelFormat,
+             lenc ? ", encoded as sRGB: the presented texture was written through an sRGB view" : ""); }
+    NSUInteger all[4] = {0, 0, sc.width, sc.height};
+    g_snap[k].scene_ok = fg_scale(cb, k, 1, sc, into, all);   // a draw, which also converts the upscaler's format to the picture's
+}
+// The counts of slot k's last fg_ui (the slot's work has run when it is taken again): what part of the picture the UI changed
+static void fg_ui_note(int k) {
+    if (!g_snap[k].ui_counted || !g_snap[k].uin) return;
+    g_snap[k].ui_counted = 0;
+    if (g_fg_scene_off > 0) return;   // already stopped: the slots still on the GPU when it stopped come in after
+    const uint32_t *c = g_snap[k].uin.contents; if (!c[0]) return;
+    double f = (double)c[1] / c[0];
+    g_fg_scene_cov += f; g_fg_scene_cov_n++; if (f > g_fg_scene_cov_max) g_fg_scene_cov_max = f;
+    if (!g_fg_scene_frames++) MLOG("frame generation: interpolating the scene before its UI, the UI put back from the present (it changed %.1f %% of the first picture)", f * 100);
+    g_fg_scene_badrun = f > 0.5 ? g_fg_scene_badrun + 1 : 0;
+    if (g_fg_scene_badrun >= FG_SCENE_BAD) {
+        g_fg_scene_off = 1;
+        MLOG("frame generation: the scene before the UI differed from the present in over half of the picture %d presents in a row (%.0f %% the last): it is not the present without its UI "
+             "(post-processing after the upscaler?), so it is no longer used and the HUD is kept by stillness", FG_SCENE_BAD, f * 100);
+    }
+    if (g_fg_scene_cov_n == 600) {
+        MLOG("frame generation: the UI changed %.1f %% of the picture on average over 600 generated frames, %.1f %% at most", g_fg_scene_cov / 6, g_fg_scene_cov_max * 100);
+        g_fg_scene_cov = g_fg_scene_cov_max = 0; g_fg_scene_cov_n = 0;
+    }
+}
+// After the interpolation of slot k's scene into g_fg_gscene: the generated frame, with the present's UI over it (fgmv_ui), into gen
+static void fg_ui(id<MTL4CommandBuffer> cb, int k, id<MTLTexture> gen) {
+    if (!g_snap[k].uin) { g_snap[k].uin = [g_dev newBufferWithLength:8 options:MTLResourceStorageModeShared]; if (!g_snap[k].uin) return; [g_snap_res addAllocation:g_snap[k].uin]; [g_snap_res commit]; }
+    memset(g_snap[k].uin.contents, 0, 8);   // its last counts were read when the slot was taken (fg_ui_note)
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];   // after MetalFX's encoders
+    [ce setArgumentTable:g_fgmv_args];
+    fgmv_bind(ce, FGMV_UI, g_snap[k].tex, g_snap[k].scene, g_fg_gscene, gen); [g_fgmv_args setAddress:g_snap[k].uin.gpuAddress atIndex:0];
+    fgmv_grid(ce, gen.width, gen.height);
+    [ce barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the present reads gen
+    [ce endEncoding];
+    g_snap[k].ui_counted = 1;
+}
 // Slot k's picture at 1/8 size as luma (fgmv_luma), after its copy in cb: the next present's motion search reads it as the picture before (fg_motion). Every present's,
 // also one that generates no frame, so the next one has it
 static void fg_luma(id<MTL4CommandBuffer> cb, int k) {
-    id<MTLTexture> col = g_snap[k].tex, l = g_snap[k].lum;
+    id<MTLTexture> col = g_snap[k].scene_ok ? g_snap[k].scene : g_snap[k].tex, l = g_snap[k].lum;   // the scene's when it has one: the UI does not mislead the search
     NSUInteger w = MAX((col.width + 7) / 8, 16), h = MAX((col.height + 7) / 8, 16);
     if (!l || l.width != w || l.height != h) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:w height:h mipmapped:NO];
@@ -15838,6 +15997,9 @@ static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
         if (g_fg_warm) g_fg_resets++;
         g_fg_warm = 0; return;
     }
+    // Both presents' scenes before their UI (fg_scene_take): the interpolator and the motion get those, and fg_ui puts the UI back. Its history is of the one or the other
+    int scene = keep && g_snap[k].scene_ok && g_snap[pk].scene_ok && g_snap[pk].scene.width == col.width && g_snap[pk].scene.height == col.height;
+    if (scene != g_fg_scene_mode) { if (g_fg_scene_mode >= 0 && g_fg_warm) g_fg_resets++; g_fg_scene_mode = scene; g_fg_warm = 0; }
     id<MTLTexture> gen = g_snap[k].gen;
     if (!gen || gen.width != col.width || gen.height != col.height || gen.pixelFormat != col.pixelFormat) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:col.pixelFormat width:col.width height:col.height mipmapped:NO];
@@ -15847,6 +16009,17 @@ static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
         [g_snap_res addAllocation:gen]; [g_snap_res commit];
         if (!g_snap[k].gen_serial) { static _Atomic uint64_t n; g_snap[k].gen_serial = (1ull << 61) + (1ull << 40) + atomic_fetch_add(&n, 1) + 1; }
         serial_put(g_snap[k].gen_serial, gen); g_snap[k].gen = gen;
+    }
+    id<MTLTexture> dst = gen;
+    if (scene) {   // the interpolated scene, which fg_ui reads to write gen (one is enough: the snapshots' command buffers run in order)
+        if (!g_fg_gscene || g_fg_gscene.width != col.width || g_fg_gscene.height != col.height || g_fg_gscene.pixelFormat != col.pixelFormat) {
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:col.pixelFormat width:col.width height:col.height mipmapped:NO];
+            d.storageMode = MTLStorageModePrivate; d.usage = fi.outputTextureUsage | MTLTextureUsageShaderRead;
+            id<MTLTexture> t = [g_dev newTextureWithDescriptor:d];   // the one replaced stays resident: a generation still on the GPU may write it
+            if (!t) { RED_ONCE(160, "frame generation: no texture for the interpolated scene"); return; }
+            [g_snap_res addAllocation:t]; [g_snap_res commit]; g_fg_gscene = t;
+        }
+        dst = g_fg_gscene;
     }
     if (g_fg_clear) {   // the depth (constant: far, 0 reversed) and the motion (none until fg_motion writes it)
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
@@ -15865,13 +16038,13 @@ static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
     if (mv) fg_motion(ce, k, pk);
     [ce barrierAfterStages:MTLStageBlit | MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
     [ce endEncoding];
-    fi.colorTexture = col; fi.prevColorTexture = prev; fi.outputTexture = gen;
+    fi.colorTexture = scene ? g_snap[k].scene : col; fi.prevColorTexture = scene ? g_snap[pk].scene : prev; fi.outputTexture = dst;
     fi.depthTexture = g_fg_depth; fi.motionTexture = g_fg_motion; fi.motionVectorScaleX = 1; fi.motionVectorScaleY = 1;
     fi.deltaTime = (float)period; fi.nearPlane = 0.1f; fi.farPlane = 1000; fi.fieldOfView = 60; fi.aspectRatio = (float)col.width / (float)col.height;
     fi.jitterOffsetX = 0; fi.jitterOffsetY = 0; fi.depthReversed = YES;
     fi.shouldResetHistory = g_fg_warm == 0;
     [fi encodeToCommandBuffer:cb];
-    if (keep) fg_keep(cb, k, pk, gen);
+    if (scene) fg_ui(cb, k, gen); else if (keep) fg_keep(cb, k, pk, gen);
     if (g_fg_heap) {   // after everything the interpolation ran (and the HUD kept)
         id<MTL4ComputeCommandEncoder> te = [cb computeCommandEncoder];
         [te barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:MTL4VisibilityOptionNone];   // the copy below is a blit
@@ -15917,6 +16090,8 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
     if (g_snap[k].old) { [g_snap_res removeAllocation:g_snap[k].old]; [g_snap_res commit]; g_snap[k].old = nil; }
     if (g_snap[k].gen_old) { [g_snap_res removeAllocation:g_snap[k].gen_old]; [g_snap_res commit]; g_snap[k].gen_old = nil; }
     if (g_snap[k].lum_old) { [g_snap_res removeAllocation:g_snap[k].lum_old]; [g_snap_res commit]; g_snap[k].lum_old = nil; }
+    if (g_snap[k].scene_old) { [g_snap_res removeAllocation:g_snap[k].scene_old]; [g_snap_res commit]; g_snap[k].scene_old = nil; }
+    fg_ui_note(k);
     g_snap[k].gen_ok = 0;
     id<MTLTexture> src = tex_mtl(t); if (!src) return 0;
     // The copy reads the source before present_now runs, so it needs the same commit as present_now: a window texture presented before any submission has used it was made just
@@ -15959,7 +16134,7 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
     [g_snap_alloc[k] reset];
     id<MTL4CommandBuffer> cb = g_snap_cb[k];
     [cb beginCommandBufferWithAllocator:g_snap_alloc[k]];
-    if (scaled) { if (!fg_scale(cb, k, src, dst, cr)) { [cb endCommandBuffer]; return 0; } }
+    if (scaled) { if (!fg_scale(cb, k, 0, src, dst, cr)) { [cb endCommandBuffer]; return 0; } }
     else {
         id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
         [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the frame's work and the slot's last blit to the screen
@@ -15970,6 +16145,8 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
     if (fg_on()) {   // the frame between the previous present and this one (frame generation): only for presents held two ticks or more, as the display link shows it
         int pk = (int)((atomic_load(&g_snap_next) + (uint64_t)g_snap_n - 1) % (uint64_t)g_snap_n);
         g_snap[k].seq = g_fg_seq;
+        NSUInteger pr[4] = {scaled || sub ? cr[0] : 0, scaled || sub ? cr[1] : 0, scaled || sub ? cr[2] : src.width, scaled || sub ? cr[3] : src.height};   // what the picture was taken from
+        fg_scene_take(cb, k, pr, dst, (__bridge void *)src == g_rt_srgb_base);
         if (fg_mv_on()) fg_luma(cb, k);
         if (period > 0.025 && !atomic_load(&g_fg_shed)) fg_encode(cb, k, pk, period); else { g_fg_warm = 0; if (period > 0.025) g_fg_shed_frames++; }
     }
