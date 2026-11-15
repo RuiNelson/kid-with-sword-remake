@@ -136,3 +136,21 @@ kernel void fgmv_keep(texture2d<float, access::read> cur [[texture(0)]], texture
     if (g.x >= out.get_width() || g.y >= out.get_height()) return;
     if (keep.read(min(g / 4, uint2(keep.get_width() - 1, keep.get_height() - 1))).r > 0.5h) out.write(cur.read(g), g);
 }
+
+// The UI over a scene interpolated without it (nvn_mtl.m fg_ui): where the game hands the host its picture before the UI is drawn over it (an upscaler the host draws, up_mfx_encode),
+// the interpolator gets that scene alone, so the UI neither smears with the motion around it nor misleads the motion search, and the present's UI is put back over the result.
+// p - s is what the UI changed in this present (zero where there is no UI). n counts, on a 4x4 grid, the pixels looked at and those the UI changed by more than 8/255: a scene that
+// does not match the present outside a HUD (post-processing after the upscaler, another size or colour space) changes most of the picture, and the host stops using it
+kernel void fgmv_ui(texture2d<float, access::read> cur [[texture(0)]], texture2d<float, access::read> scene [[texture(1)]], texture2d<float, access::read> gs [[texture(2)]],
+                    texture2d<float, access::write> out [[texture(3)]], device atomic_uint *n [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= out.get_width() || g.y >= out.get_height()) return;
+    float4 p = cur.read(g);
+    float3 s = scene.read(g).rgb, gi = gs.read(g).rgb, d = fabs(p.rgb - s);
+    float m = max(d.x, max(d.y, d.z));   // how much the UI changed this pixel
+    if (!(g.x & 3) && !(g.y & 3)) { atomic_fetch_add_explicit(&n[0], 1, memory_order_relaxed); if (m > 8.0f / 255) atomic_fetch_add_explicit(&n[1], 1, memory_order_relaxed); }
+    // The UI's alpha is not known: p = s (1 - a) + ui a. Adding what it changed (gi + p - s) is right for a faint UI and lets the motion behind an opaque one through; the
+    // present's own pixel is right for an opaque UI and holds the background behind a faint one. A small change takes the first, a large one the second; none leaves gi
+    float w = smoothstep(2.0f / 255, 0.25f, m);
+    float3 o = saturate(mix(gi + (p.rgb - s), p.rgb, w));
+    out.write(float4(o, p.a), g);
+}
