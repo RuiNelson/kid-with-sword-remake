@@ -5,7 +5,12 @@
 //   fgmv_search  each tile of 8x8 of those (64x64 px of the picture) searched against the previous present's luma within +-FGMV_R (+-192 px), with a sub-pixel fit
 //   fgmv_pick    each 1/8 pixel takes, of its tile's vector, its 8 neighbours' and no motion, the one that matches best around it, so a still HUD or a character the camera
 //                follows keeps no motion beside the panning background
-// The motion texture is at 1/8 size, its vectors in its own pixels pointing to where a pixel was in the previous picture (MetalFX's convention, scale 1)
+// and, by default (DM_FRAMEGEN_MV=2), two more at 1/2 size, where the 1/8 field's 64 px tiles and 8 px blocks gave blocky edges around anything moving against its background
+// (a character the camera follows, its sword, the edge of a wall on a turn):
+//   fgmv_luma2   each 2x2 block's mean luma (one per present, as fgmv_luma)
+//   fgmv_refine  each 1/2 pixel takes, of the 1/8 field's vectors around it and no motion, the one that matches best around it (a 5x5 window), then refines it by 1 and 1/2
+//                of its pixels (steps of 4 and 2 as well looked no better on Ocarina of Time and cost 1.2 ms more)
+// The motion texture is at 1/8 size (DM_FRAMEGEN_MV=1) or 1/2, its vectors in its own pixels pointing to where a pixel was in the previous picture (MetalFX's convention, scale 1)
 #include <metal_stdlib>
 using namespace metal;
 
@@ -154,3 +159,68 @@ kernel void fgmv_ui(texture2d<float, access::read> cur [[texture(0)]], texture2d
     float3 o = saturate(mix(gi + (p.rgb - s), p.rgb, w));
     out.write(float4(o, p.a), g);
 }
+
+// Frame generation's motion at 1/2 size (nvn_mtl.m fg_motion, DM_FRAMEGEN_MV=2): see the top of this file
+kernel void fgmv_luma2(texture2d<float, access::read> src [[texture(0)]], texture2d<half, access::write> dst [[texture(1)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= dst.get_width() || g.y >= dst.get_height()) return;
+    uint2 mx = uint2(src.get_width() - 1, src.get_height() - 1), o = g * 2;
+    float s = 0;
+    for (uint y = 0; y < 2; y++) for (uint x = 0; x < 2; x++) s += dot(src.read(min(o + uint2(x, y), mx)).rgb, float3(0.299, 0.587, 0.114));
+    dst.write(half4(half(s / 4)), g);
+}
+// The mean absolute difference between cur around g and prev around g + v (bilinear), over 9 taps 2 pixels apart: a 5x5 window at the cost of a 3x3
+static float fgmv_cost2(texture2d<half, access::read> cur, texture2d<half, access::sample> prev, int2 g, float2 v, float2 inv, int2 mx) {
+    constexpr sampler ls(coord::normalized, address::clamp_to_edge, filter::linear);
+    float s = 0;
+    for (int y = -2; y <= 2; y += 2) for (int x = -2; x <= 2; x += 2) {
+        int2 q = clamp(g + int2(x, y), int2(0), mx);
+        s += fabs(float(cur.read(uint2(q)).r) - float(prev.sample(ls, (float2(q) + 0.5f + v) * inv).r));
+    }
+    return s * (1.0f / 9);
+}
+kernel void fgmv_refine(texture2d<half, access::read> cur [[texture(0)]], texture2d<half, access::sample> prev [[texture(1)]], texture2d<half, access::read> m8 [[texture(2)]],
+                        texture2d<half, access::write> mot [[texture(3)]], uint2 g [[thread_position_in_grid]]) {
+    if (g.x >= mot.get_width() || g.y >= mot.get_height()) return;
+    int2 mx = int2(cur.get_width() - 1, cur.get_height() - 1), cm = int2(m8.get_width() - 1, m8.get_height() - 1), gi = int2(g), c = gi / 4;
+    float2 inv = 1.0f / float2(prev.get_width(), prev.get_height());
+    float2 bv = 0; float bc = fgmv_cost2(cur, prev, gi, 0, inv, mx) - 0.004f;   // no motion wins ties, as fgmv_pick
+    int still = 1;
+    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+        float2 v = float2(m8.read(uint2(clamp(c + int2(x, y), int2(0), cm))).xy) * 4.0f;   // 1/8 pixels to 1/2 pixels
+        if (still == 0 && all(v == bv)) continue;
+        float cst = fgmv_cost2(cur, prev, gi, v, inv, mx) - (x == 0 && y == 0 ? 0.001f : 0);   // the block's own vector wins ties: a smooth field
+        if (cst < bc) { bc = cst; bv = v; still = 0; }
+    }
+    if (!still) {   // a step of 1, then of 1/2, around the vector picked; a step is taken only for a clear gain, so flat areas keep the coarse vector
+        for (float st = 1.0f; st >= 0.5f; st *= 0.5f) {
+            float2 sv = bv;
+            for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+                if (!x && !y) continue;
+                float2 v = sv + float2(x, y) * st; float cst = fgmv_cost2(cur, prev, gi, v, inv, mx) + 0.001f;
+                if (cst < bc) { bc = cst; bv = v; }
+            }
+        }
+    }
+    mot.write(half4(half(bv.x), half(bv.y), 0, 0), g);
+}
+
+// The game's depth for the interpolator (nvn_mtl.m fg_depth): with a constant depth MetalFX cannot tell what is in front where the two pictures disagree, and thin things
+// that move against their background (Link's legs, the fairy) came out with holes, the background drawn through them. The scene's depth (the frame's last depth attachment
+// of the picture's shape, fg_depth_note) is reduced to the interpolator's depth size, each pixel the nearest of its block (min, or max for a reversed depth: fgmv_dfs_max),
+// so a thin near thing keeps its block in front. One triangle over the whole target; uv runs over the game's depth texture
+struct fgmv_dv { float4 p [[position]]; float2 uv; };
+vertex fgmv_dv fgmv_dvs(uint i [[vertex_id]]) {
+    float2 q = float2((i << 1) & 2, i & 2);
+    fgmv_dv o; o.p = float4(q * 2 - 1, 0, 1); o.uv = float2(q.x, 1 - q.y); return o;
+}
+struct fgmv_dout { float d [[depth(any)]]; };
+static float fgmv_dnear(fgmv_dv in, depth2d<float, access::read> d, bool rev) {
+    float2 ds = float2(d.get_width(), d.get_height()), c = in.uv * ds, h = float2(fabs(dfdx(in.uv.x)), fabs(dfdy(in.uv.y))) * ds * 0.5f;
+    int2 mx = int2(ds) - 1, lo = clamp(int2(floor(c - h)), int2(0), mx), hi = clamp(int2(ceil(c + h)) - 1, lo, mx);
+    int2 st = max(int2(1), (hi - lo + 1) / 8);   // up to 8x8 reads a pixel
+    float v = rev ? 0.0f : 1.0f;
+    for (int y = lo.y; y <= hi.y; y += st.y) for (int x = lo.x; x <= hi.x; x += st.x) { float z = d.read(uint2(x, y)); v = rev ? max(v, z) : min(v, z); }
+    return v;
+}
+fragment fgmv_dout fgmv_dfs_min(fgmv_dv in [[stage_in]], depth2d<float, access::read> d [[texture(0)]]) { fgmv_dout o; o.d = fgmv_dnear(in, d, false); return o; }
+fragment fgmv_dout fgmv_dfs_max(fgmv_dv in [[stage_in]], depth2d<float, access::read> d [[texture(0)]]) { fgmv_dout o; o.d = fgmv_dnear(in, d, true); return o; }

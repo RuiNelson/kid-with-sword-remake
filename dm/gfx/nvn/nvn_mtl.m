@@ -2298,7 +2298,7 @@ static int obj_is_tex(id o) {
     int a = [o conformsToProtocol:@protocol(MTLTexture)]; unsigned k = nx++ % NC; ans[k] = (int8_t)a; cls[k] = c;
     return a;
 }
-static int g_red_once[161];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[162];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -5385,6 +5385,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
         if (t && depth) {
             pd.depthAttachment.loadAction = R.clear_d ? MTLLoadActionClear : MTLLoadActionLoad;
             pd.depthAttachment.clearDepth = pf == MTLPixelFormatDepth16Unorm ? nvn_depth16_clear_value(R.cd) : R.cd; pd.depthAttachment.storeAction = MTLStoreActionStore;
+            void fg_depth_note(id<MTLTexture> t, int cleared, double cd); fg_depth_note(t, R.clear_d, pd.depthAttachment.clearDepth);   // frame generation's depth
         } else pd.depthAttachment.texture = nil;
         if (t && stencil) {
             pd.stencilAttachment.texture = t; pd.stencilAttachment.level = pd.depthAttachment.level;
@@ -15637,7 +15638,7 @@ extern _Atomic uint64_t dm_present_ns;   // hle_thread.c (DM_HITCH_DUMP); the NV
 // old: the slot's texture before the presented size or format last changed, resident until the slot's next use (snap_take)
 // gen / gen_old / gen_serial: the frame generated between the slot's present and the one before (frame generation, below), gen_ok when it holds one; seq: the slot's present
 // in the order of all presents (fg_seq), for whether two slots hold consecutive presents
-static struct { id<MTLTexture> tex, old, gen, gen_old, lum, lum_old, scene, scene_old, scene_enc; id<MTLBuffer> uin; uint64_t serial, gen_serial, seq; int gen_ok, scene_ok, ui_counted; _Atomic uint64_t ticket, ev; } g_snap[SNAP_MAX];
+static struct { id<MTLTexture> tex, old, gen, gen_old, lum, lum_old, lum2, lum2_old, scene, scene_old, scene_enc; id<MTLBuffer> uin; uint64_t serial, gen_serial, seq; int gen_ok, scene_ok, ui_counted; _Atomic uint64_t ticket, ev; } g_snap[SNAP_MAX];
 // lum: frame generation's 1/8 luma of tex, or of scene when it has one (fg_luma); scene: the present's picture before its UI, as tex is copied (fg_scene_take); uin: fg_ui's counts
 static id<MTL4CommandAllocator> g_snap_alloc[SNAP_MAX]; static id<MTL4CommandBuffer> g_snap_cb[SNAP_MAX];
 static id<MTLResidencySet> g_snap_res; static id<MTLSharedEvent> g_snap_ev; static uint64_t g_snap_v;
@@ -15670,15 +15671,17 @@ static int fg_on(void) {
     return g_fg_mode = v;
 }
 // DM_FRAMEGEN_MV (default 1): frame generation's motion from the presented pictures (fg_motion) and the still HUD kept (fg_keep); 0: no motion, as X6-X9
-static id<MTLComputePipelineState> g_fgmv_ps[7]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
-enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_UI };
+static id<MTLComputePipelineState> g_fgmv_ps[9]; static id<MTL4ArgumentTable> g_fgmv_args; static int g_fgmv_ok = -1;
+static int g_fgmv_lv = 2;   // DM_FRAMEGEN_MV: 1 the motion at 1/8 size, 2 (the default) refined at 1/2 size (fgmv_refine), with the game's depth at that size too (fg_depth)
+enum { FGMV_LUMA, FGMV_SEARCH, FGMV_PICK, FGMV_STILL, FGMV_HUD, FGMV_KEEP, FGMV_UI, FGMV_LUMA2, FGMV_REFINE };
 static int fg_mv_on(void) {
     if (g_fgmv_ok >= 0) return g_fgmv_ok;
     const char *e = getenv("DM_FRAMEGEN_MV");
     if (e && atoi(e) <= 0) { MLOG("frame generation: no motion given to the interpolator (DM_FRAMEGEN_MV=0): its own flow finds it, up to about 64 px a frame"); return g_fgmv_ok = 0; }
+    if (e) g_fgmv_lv = atoi(e) >= 2 ? 2 : 1;
     NSError *err = nil; id<MTLLibrary> lib = host_lib("fgmv", &err);
-    static const char *fn[7] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_ui"};
-    for (int i = 0; i < 7; i++) {
+    static const char *fn[9] = {"fgmv_luma", "fgmv_search", "fgmv_pick", "fgmv_still", "fgmv_hud", "fgmv_keep", "fgmv_ui", "fgmv_luma2", "fgmv_refine"};
+    for (int i = 0; i < 9; i++) {
         id<MTLFunction> f = lib ? [lib newFunctionWithName:@(fn[i])] : nil;
         g_fgmv_ps[i] = f ? [g_dev newComputePipelineStateWithFunction:f error:&err] : nil;
         if (!g_fgmv_ps[i]) { MLOG("[RED] frame generation: no %s pipeline (%s): the interpolator gets no motion, as X6-X9", fn[i], err.description.UTF8String); return g_fgmv_ok = 0; }
@@ -15687,7 +15690,8 @@ static int fg_mv_on(void) {
     MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 4; ad.maxBufferBindCount = 1;   // the buffer: fg_ui's counts
     g_fgmv_args = [g_dev newArgumentTableWithDescriptor:ad error:&err];
     if (!g_fgmv_args) { MLOG("[RED] frame generation: no argument table for the motion (%s): no motion given", err.description.UTF8String); return g_fgmv_ok = 0; }
-    MLOG("frame generation: motion found from the presented pictures (DM_FRAMEGEN_MV=1: 64 px tiles searched within 192 px at 1/8 size), the still HUD kept from the present");
+    MLOG("frame generation: motion found from the presented pictures (DM_FRAMEGEN_MV=%d: 64 px tiles searched within 192 px at 1/8 size%s), the still HUD kept from the present",
+         g_fgmv_lv, g_fgmv_lv >= 2 ? ", refined per pixel at 1/2 size" : "");
     return g_fgmv_ok = 1;
 }
 // The formats fg_keep may write the generated frame in (shader writes; not the sRGB ones)
@@ -15716,7 +15720,8 @@ static double g_fg_gpu_last;   // the last interpolation's GPU time in seconds (
 static NSUInteger g_fg_key[3]; static int g_fg_bad;   // the interpolator's colour format, width and height; g_fg_bad: MetalFX made none for them
 static id<MTLTexture> g_fg_depth, g_fg_motion; static int g_fg_clear;   // the depth (constant: far) and motion inputs, cleared by the first command buffer after they are made;
 // the motion is fg_motion's from X10 on (at 1/8 size), else constant (none, at half size)
-static id<MTLTexture> g_fg_tiles, g_fg_still, g_fg_keep;   // fg_motion's tile vectors; fg_keep's still blocks and the blocks kept (4x4 px each)
+static id<MTLTexture> g_fg_tiles, g_fg_still, g_fg_keep, g_fg_mot8;   // g_fg_mot8: the 1/8 field fgmv_refine starts from (DM_FRAMEGEN_MV=2)
+// g_fg_tiles: fg_motion's tile vectors; fg_keep's still blocks and the blocks kept (4x4 px each)
 static uint64_t g_fg_seq;   // presents that could be copied (present_enqueue), for g_snap[].seq
 static int g_fg_warm;   // interpolations since the history last started again
 static uint64_t g_fg_made, g_fg_resets;
@@ -15728,8 +15733,10 @@ static id<MTL4FXFrameInterpolator> fg_for(id<MTLTexture> col) {
     uint64_t t0 = now_ns(); NSError *err = nil;
     if (!g_fg_comp) g_fg_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&err];
     // The depth and motion inputs at 1/8 of the picture's size, as fg_motion finds the motion (its vectors in those pixels); with no motion at half the size, as X6-X9
-    int mv = fg_mv_on();
-    NSUInteger iw = mv ? MAX((col.width + 7) / 8, 16) : MAX(col.width / 2, 16), ih = mv ? MAX((col.height + 7) / 8, 16) : MAX(col.height / 2, 16);
+    // (DM_FRAMEGEN_MV=2: at 1/2 size, refined from the 1/8 field, g_fg_mot8)
+    int mv = fg_mv_on(), fine = mv && g_fgmv_lv >= 2;
+    NSUInteger w8 = MAX((col.width + 7) / 8, 16), h8 = MAX((col.height + 7) / 8, 16);
+    NSUInteger iw = fine ? MAX((col.width + 1) / 2, 16) : mv ? w8 : MAX(col.width / 2, 16), ih = fine ? MAX((col.height + 1) / 2, 16) : mv ? h8 : MAX(col.height / 2, 16);
     MTLFXFrameInterpolatorDescriptor *d = [MTLFXFrameInterpolatorDescriptor new];
     d.colorTextureFormat = col.pixelFormat; d.outputTextureFormat = col.pixelFormat;
     d.depthTextureFormat = MTLPixelFormatDepth32Float; d.motionTextureFormat = MTLPixelFormatRG16Float;
@@ -15743,14 +15750,17 @@ static id<MTL4FXFrameInterpolator> fg_for(id<MTLTexture> col) {
     id<MTLTexture> dep = [g_dev newTextureWithDescriptor:dd], mot = [g_dev newTextureWithDescriptor:md];
     if (!dep || !mot) { RED_ONCE(155, "frame generation: no depth or motion texture"); return nil; }
     if (mv) {   // fg_motion's tiles (8x8 of the 1/8 pixels each) and fg_keep's 4x4 px blocks
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(iw + 7) / 8 height:(ih + 7) / 8 mipmapped:NO];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:(w8 + 7) / 8 height:(h8 + 7) / 8 mipmapped:NO];
         td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         MTLTextureDescriptor *bd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:(col.width + 3) / 4 height:(col.height + 3) / 4 mipmapped:NO];
         bd.storageMode = MTLStorageModePrivate; bd.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         id<MTLTexture> tl = [g_dev newTextureWithDescriptor:td], sb = [g_dev newTextureWithDescriptor:bd], kb = [g_dev newTextureWithDescriptor:bd];
-        if (!tl || !sb || !kb) { RED_ONCE(155, "frame generation: no textures for the motion"); return nil; }
-        [g_snap_res addAllocation:tl]; [g_snap_res addAllocation:sb]; [g_snap_res addAllocation:kb];
-        g_fg_tiles = tl; g_fg_still = sb; g_fg_keep = kb;
+        id<MTLTexture> m8 = nil;
+        if (fine) { MTLTextureDescriptor *m8d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:w8 height:h8 mipmapped:NO];
+            m8d.storageMode = MTLStorageModePrivate; m8d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite; m8 = [g_dev newTextureWithDescriptor:m8d]; }
+        if (!tl || !sb || !kb || (fine && !m8)) { RED_ONCE(155, "frame generation: no textures for the motion"); return nil; }
+        [g_snap_res addAllocation:tl]; [g_snap_res addAllocation:sb]; [g_snap_res addAllocation:kb]; if (m8) [g_snap_res addAllocation:m8];
+        g_fg_tiles = tl; g_fg_still = sb; g_fg_keep = kb; g_fg_mot8 = m8;
     }
     // The ones they replace stay resident: a generation committed before this one may still read them (they are tiny, and a size change is rare)
     [g_snap_res addAllocation:dep]; [g_snap_res addAllocation:mot]; [g_snap_res commit];
@@ -15760,7 +15770,7 @@ static id<MTL4FXFrameInterpolator> fg_for(id<MTLTexture> col) {
         if (g_fg_tsbuf) { [g_snap_res addAllocation:g_fg_tsbuf]; [g_snap_res commit]; }
         if (!g_fg_heap || !g_fg_tsbuf) { MLOG("frame generation: no timestamp heap (%s): its GPU time is not logged", err.description.UTF8String); g_fg_heap = nil; } }
     MLOG("frame generation: MetalFX frame interpolator %lux%lu format %lu (depth and motion %lux%lu%s), made in %.1f ms", (unsigned long)col.width, (unsigned long)col.height,
-         (unsigned long)col.pixelFormat, (unsigned long)iw, (unsigned long)ih, mv ? (fg_keep_fmt(col.pixelFormat) ? ", motion found, HUD kept" : ", motion found; this format cannot be written, the HUD is not kept") : "", (now_ns() - t0) / 1e6);
+         (unsigned long)col.pixelFormat, (unsigned long)iw, (unsigned long)ih, mv ? (fg_keep_fmt(col.pixelFormat) ? (fine ? ", motion found and refined, HUD kept" : ", motion found, HUD kept") : ", motion found; this format cannot be written, the HUD is not kept") : "", (now_ns() - t0) / 1e6);
     return fi;
 }
 // With frame generation, a picture shown smaller than the game draws it (an iPhone: a 3136x1440 picture on a 2622x1206 screen) is copied at the size it is shown at, and
@@ -15959,6 +15969,17 @@ static void fg_luma(id<MTL4CommandBuffer> cb, int k) {
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];   // after the copy
     [ce setArgumentTable:g_fgmv_args]; fgmv_bind(ce, FGMV_LUMA, col, l, nil, nil); fgmv_grid(ce, w, h);
+    if (g_fgmv_lv >= 2) {   // the 1/2 size luma fgmv_refine reads
+        id<MTLTexture> l2 = g_snap[k].lum2; NSUInteger w2 = MAX((col.width + 1) / 2, 16), h2 = MAX((col.height + 1) / 2, 16);
+        if (!l2 || l2.width != w2 || l2.height != h2) {
+            MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:w2 height:h2 mipmapped:NO];
+            d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+            g_snap[k].lum2_old = l2;   // resident until the slot's next use (snap_take)
+            if ((l2 = [g_dev newTextureWithDescriptor:d])) { [g_snap_res addAllocation:l2]; [g_snap_res commit]; } else RED_ONCE(159, "frame generation: no luma texture for the motion");
+            g_snap[k].lum2 = l2;
+        }
+        if (l2) { fgmv_bind(ce, FGMV_LUMA2, col, l2, nil, nil); fgmv_grid(ce, w2, h2); }
+    }
     [ce barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
     [ce endEncoding];
 }
@@ -15969,7 +15990,80 @@ static void fg_motion(id<MTL4ComputeCommandEncoder> ce, int k, int pk) {
     fgmv_bind(ce, FGMV_SEARCH, cl, pl, g_fg_tiles, nil);
     [ce dispatchThreadgroups:MTLSizeMake(g_fg_tiles.width, g_fg_tiles.height, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     fgmv_step(ce);
-    fgmv_bind(ce, FGMV_PICK, cl, pl, g_fg_tiles, g_fg_motion); fgmv_grid(ce, g_fg_motion.width, g_fg_motion.height);
+    id<MTLTexture> c2 = g_snap[k].lum2, p2 = g_snap[pk].lum2;
+    int fine = g_fg_mot8 && c2 && p2 && c2.width == g_fg_motion.width && c2.height == g_fg_motion.height && p2.width == c2.width && p2.height == c2.height;
+    if (g_fg_mot8 && !fine) RED_ONCE(161, "frame generation: no 1/2 size luma for the motion's refinement: the motion of such frames is left as it was");
+    if (g_fg_mot8 && !fine) return;
+    id<MTLTexture> m = fine ? g_fg_mot8 : g_fg_motion;
+    fgmv_bind(ce, FGMV_PICK, cl, pl, g_fg_tiles, m); fgmv_grid(ce, m.width, m.height);
+    if (fine) { fgmv_step(ce); fgmv_bind(ce, FGMV_REFINE, c2, p2, g_fg_mot8, g_fg_motion); fgmv_grid(ce, g_fg_motion.width, g_fg_motion.height); }
+}
+// The game's depth for frame generation's interpolator (fgmv_dfs_min / _max). The candidate is the frame's last depth attachment of the picture's shape (fg_depth_note, from
+// rp_begin): shadow maps and other square or small depth targets are passed over by its shape, and the scene's depth is drawn last of a frame's depths in the games looked at
+// (Ocarina of Time: its 1920x1080 Depth32Float, cleared to 1, used up to the pass before its upscaler). A depth cleared to 0 is taken as reversed (nearer is larger). The
+// candidate is used only when an attachment was made since the last present: a frame with no 3D (a menu) falls back to the constant far depth. DM_FRAMEGEN_DEPTH=0 leaves it out
+static os_unfair_lock g_fgd_mu = OS_UNFAIR_LOCK_INIT;
+static __strong id<MTLTexture> g_fgd_tex; static void *g_fgd_clr_for[8]; static int g_fgd_clr_rev[8], g_fgd_clr_next; static uint64_t g_fgd_n; static double g_fgd_aspect;   // g_fgd_clr_*: the depth textures last cleared, and whether to 0
+static id<MTLRenderPipelineState> g_fgd_ps[2]; static id<MTLDepthStencilState> g_fgd_dss; static id<MTL4ArgumentTable> g_fgd_args; static int g_fgd_ok = -1, g_fgd_mode;
+static int fg_depth_on(void) {
+    if (g_fgd_ok >= 0) return g_fgd_ok;
+    const char *e = getenv("DM_FRAMEGEN_DEPTH");
+    if (e && atoi(e) <= 0) { MLOG("frame generation: the interpolator's depth is constant (DM_FRAMEGEN_DEPTH=0)"); return g_fgd_ok = 0; }
+    NSError *err = nil; id<MTLLibrary> lib = host_lib("fgmv", &err);
+    for (int i = 0; i < 2; i++) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [lib newFunctionWithName:@"fgmv_dvs"]; pd.fragmentFunction = [lib newFunctionWithName:i ? @"fgmv_dfs_max" : @"fgmv_dfs_min"];
+        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        g_fgd_ps[i] = lib && pd.vertexFunction && pd.fragmentFunction ? [g_dev newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+        if (!g_fgd_ps[i]) { MLOG("[RED] frame generation: no pipeline for the game's depth (%s): the interpolator's depth stays constant", err.description.UTF8String); return g_fgd_ok = 0; }
+    }
+    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES;
+    g_fgd_dss = [g_dev newDepthStencilStateWithDescriptor:dd];
+    MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1;
+    g_fgd_args = [g_dev newArgumentTableWithDescriptor:ad error:&err];
+    if (!g_fgd_dss || !g_fgd_args) { MLOG("[RED] frame generation: no depth state or argument table for the game's depth: the interpolator's depth stays constant"); return g_fgd_ok = 0; }
+    return g_fgd_ok = 1;
+}
+void fg_depth_note(id<MTLTexture> t, int cleared, double cd) {
+    if (!fg_on() || !t || t.sampleCount != 1 || t.textureType != MTLTextureType2D || !(t.usage & MTLTextureUsageShaderRead)) return;
+    MTLPixelFormat f = t.pixelFormat;
+    if (f != MTLPixelFormatDepth32Float && f != MTLPixelFormatDepth32Float_Stencil8 && f != MTLPixelFormatDepth16Unorm) return;
+    os_unfair_lock_lock(&g_fgd_mu);
+    void *b = (__bridge void *)(t.parentTexture ? t.parentTexture : t);
+    if (cleared) { int i = 0; while (i < 8 && g_fgd_clr_for[i] != b) i++;
+        if (i == 8) { i = g_fgd_clr_next; g_fgd_clr_next = (i + 1) & 7; g_fgd_clr_for[i] = b; }
+        g_fgd_clr_rev[i] = cd < 0.5; }
+    double a = g_fgd_aspect, ta = (double)t.width / (double)t.height;
+    if (t.width >= 64 && (a <= 0 || fabs(ta - a) <= 0.03 * a)) { g_fgd_tex = t; g_fgd_n++; }
+    os_unfair_lock_unlock(&g_fgd_mu);
+}
+// Into cb before the interpolation: the game's depth reduced into g_fg_depth (1, *rev: whether it is reversed), or 0 when there is none for this present
+static int fg_depth(id<MTL4CommandBuffer> cb, id<MTLTexture> col, BOOL *rev) {
+    double a = (double)col.width / (double)col.height;
+    os_unfair_lock_lock(&g_fgd_mu);
+    g_fgd_aspect = a; id<MTLTexture> t = g_fgd_tex; uint64_t n = g_fgd_n;
+    void *b = t ? (__bridge void *)(t.parentTexture ? t.parentTexture : t) : NULL; int r = 0; for (int i = 0; i < 8 && b; i++) if (g_fgd_clr_for[i] == b) r = g_fgd_clr_rev[i];
+    os_unfair_lock_unlock(&g_fgd_mu);
+    static uint64_t last; int fresh = n != last; last = n;
+    if (!fg_depth_on() || !t || !fresh || !g_fg_depth) return 0;
+    if (fabs((double)t.width / (double)t.height - a) > 0.03 * a) return 0;
+    static NSUInteger said[4]; NSUInteger key[4] = {t.width, t.height, t.pixelFormat, (NSUInteger)r};
+    if (memcmp(said, key, sizeof key)) { memcpy(said, key, sizeof key);
+        MLOG("frame generation: the game's depth %lux%lu format %lu%s, the nearest of each block, as the interpolator's %lux%lu depth", (unsigned long)t.width, (unsigned long)t.height,
+             (unsigned long)t.pixelFormat, r ? " (reversed: cleared to 0)" : "", (unsigned long)g_fg_depth.width, (unsigned long)g_fg_depth.height); }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.depthAttachment.texture = g_fg_depth; rp.depthAttachment.loadAction = MTLLoadActionDontCare; rp.depthAttachment.storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!en) { RED_ONCE(161, "frame generation: no render encoder for the game's depth"); return 0; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:resource_vis()];   // after the frame's work
+    [en setArgumentTable:g_fgd_args atStages:MTLRenderStageFragment]; [g_fgd_args setTexture:t.gpuResourceID atIndex:0];
+    [en setRenderPipelineState:g_fgd_ps[r ? 1 : 0]]; [en setDepthStencilState:g_fgd_dss];
+    [en setViewport:(MTLViewport){0, 0, g_fg_depth.width, g_fg_depth.height, 0, 1}];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [en barrierAfterStages:MTLStageFragment beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the game's next frame writes its depth again
+    [en endEncoding];
+    *rev = r ? YES : NO;
+    return 1;
 }
 // After the interpolation: the still detailed pixels of slot k's picture, and still ones near them (a HUD), written over the generated frame (fgmv_still, fgmv_hud, fgmv_keep)
 static void fg_keep(id<MTL4CommandBuffer> cb, int k, int pk, id<MTLTexture> gen) {
@@ -16021,11 +16115,13 @@ static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
         }
         dst = g_fg_gscene;
     }
+    BOOL drev = YES; int gd = fg_depth_on() && fg_depth(cb, col, &drev) ? 1 : 0;   // the game's depth (fg_depth), else the constant one, cleared again when it comes back
+    if (gd != g_fgd_mode) { if (!gd) g_fg_clear = 1; g_fgd_mode = gd; }
     if (g_fg_clear) {   // the depth (constant: far, 0 reversed) and the motion (none until fg_motion writes it)
         MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         rp.colorAttachments[0].texture = g_fg_motion; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        rp.depthAttachment.texture = g_fg_depth; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 0;
+        if (!gd) { rp.depthAttachment.texture = g_fg_depth; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 0; }   // not the game's depth just drawn
         id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
         if (!en) { RED_ONCE(157, "frame generation: the constant inputs could not be cleared"); return; }
         [en endEncoding]; g_fg_clear = 0;
@@ -16041,7 +16137,7 @@ static void fg_encode(id<MTL4CommandBuffer> cb, int k, int pk, double period) {
     fi.colorTexture = scene ? g_snap[k].scene : col; fi.prevColorTexture = scene ? g_snap[pk].scene : prev; fi.outputTexture = dst;
     fi.depthTexture = g_fg_depth; fi.motionTexture = g_fg_motion; fi.motionVectorScaleX = 1; fi.motionVectorScaleY = 1;
     fi.deltaTime = (float)period; fi.nearPlane = 0.1f; fi.farPlane = 1000; fi.fieldOfView = 60; fi.aspectRatio = (float)col.width / (float)col.height;
-    fi.jitterOffsetX = 0; fi.jitterOffsetY = 0; fi.depthReversed = YES;
+    fi.jitterOffsetX = 0; fi.jitterOffsetY = 0; fi.depthReversed = gd ? drev : YES;
     fi.shouldResetHistory = g_fg_warm == 0;
     [fi encodeToCommandBuffer:cb];
     if (scene) fg_ui(cb, k, gen); else if (keep) fg_keep(cb, k, pk, gen);
@@ -16090,6 +16186,7 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
     if (g_snap[k].old) { [g_snap_res removeAllocation:g_snap[k].old]; [g_snap_res commit]; g_snap[k].old = nil; }
     if (g_snap[k].gen_old) { [g_snap_res removeAllocation:g_snap[k].gen_old]; [g_snap_res commit]; g_snap[k].gen_old = nil; }
     if (g_snap[k].lum_old) { [g_snap_res removeAllocation:g_snap[k].lum_old]; [g_snap_res commit]; g_snap[k].lum_old = nil; }
+    if (g_snap[k].lum2_old) { [g_snap_res removeAllocation:g_snap[k].lum2_old]; [g_snap_res commit]; g_snap[k].lum2_old = nil; }
     if (g_snap[k].scene_old) { [g_snap_res removeAllocation:g_snap[k].scene_old]; [g_snap_res commit]; g_snap[k].scene_old = nil; }
     fg_ui_note(k);
     g_snap[k].gen_ok = 0;
