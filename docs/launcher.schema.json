@@ -8,9 +8,20 @@
   "properties": {
     "schema": {"description": "The list's version; a list without it is schema 1 written before the field existed.", "type": "integer", "const": 1},
     "game": {"description": "The base game's title ID.", "type": "string", "pattern": "^[0-9A-F]{16}$"},
+    "tabs": {"description": "The settings screen's tabs the rows use, in the order to show them: each row's section names one. Absent in lists written before tabs; a reader then draws each section as a tab, or as a heading.", "type": "array", "items": {"$ref": "#/$defs/tab"}},
     "settings": {"type": "array", "items": {"$ref": "#/$defs/setting"}}
   },
   "$defs": {
+    "tab": {
+      "type": "object",
+      "required": ["name", "icon", "about", "tech"],
+      "properties": {
+        "name": {"description": "The tab's title, as the rows' section gives it.", "type": "string"},
+        "icon": {"description": "An SF Symbol name for the tab.", "type": "string"},
+        "about": {"description": "What the tab's settings are for, in plain words.", "type": "string"},
+        "tech": {"description": "The same, for a player who wants the technical details.", "type": "string"}
+      }
+    },
     "size": {"description": "[width, height] in pixels.", "type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
     "setting": {
       "type": "object",
@@ -18,9 +29,10 @@
       "properties": {
         "env": {"description": "The environment switch the setting sets.", "type": "string", "pattern": "^DM_[A-Z0-9_]+$"},
         "kind": {"enum": ["choice", "range", "toggle"]},
-        "section": {"description": "The heading it goes under (Game, Controls and Performance today); sections and rows come in the order to show them. A reader draws a section it does not know like the others, under its name.", "type": "string"},
+        "section": {"description": "The tab (or heading) it goes under: Game, Picture, Smoothness, Controls, Performance and Diagnostics today, described in tabs; sections and rows come in the order to show them. A reader draws a section it does not know like the others, under its name.", "type": "string"},
         "label": {"type": "string"},
-        "note": {"description": "The line under the label; empty for most settings.", "type": "string"},
+        "note": {"description": "The line under the label, in plain words anyone can follow (may be empty): what it does, its cost, then the setting recommended.", "type": "string"},
+        "tech": {"description": "The technical description, for a player who asks for technical details; absent when the setting has none.", "type": "string"},
         "default": {"description": "The tested default for this app's platform, with profile defaults resolved.", "type": "string"},
         "options": {"description": "choice: [value, label] pairs.", "type": "array", "items": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}},
         "min": {"description": "range: the lowest value.", "type": "number"},

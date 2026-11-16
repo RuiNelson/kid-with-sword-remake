@@ -1,6 +1,7 @@
 // Launcher: the settings screen shown before the game starts (front_ios.m dm_show_launcher). Its settings come from the app's dm/launcher.json (an app of several programs: dm/p<N>/launcher.json), which build_ipa.sh writes for this game
 // from dm/games/settings.tsv (dm/games/settings.py): each sets an environment variable the host reads when the game starts. A variable an env file set (Documents/env.txt, the bundle's
-// dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) starts at that value and can still be changed (LauncherSettings.swift fromFile). All settings share one screen, grouped by section (rows: LauncherRow.swift). Choices that differ from the game's default are kept
+// dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) starts at that value and can still be changed (LauncherSettings.swift fromFile). The settings are in tabs, one per section of the list (Game, Picture, Smoothness, Controls, Performance, Diagnostics), each with a plain description and,
+// with Technical details on, a technical one (SwiftUI's TabView, sidebarAdaptable; rows, tabs and headers: LauncherRow.swift). Choices that differ from the game's default are kept
 // in UserDefaults; Reset to tested defaults shows the defaults, and Play then forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once with the saved choices; DM_SAVED_CHOICES=0 ignores them (and keeps them)
 import SwiftUI
 import UIKit
@@ -96,6 +97,7 @@ private struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let play: () -> Void
     @State private var memory = os_proc_available_memory()
+    @AppStorage("window.technical") private var technical = false
 
     var body: some View {
         GeometryReader { geometry in
@@ -114,32 +116,20 @@ private struct LauncherView: View {
                 }
                 .padding(16)
                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
-                List {
-                    ForEach(m.sections, id: \.self) { section in
-                        let rows = m.rows(in: section)
-                        if !rows.isEmpty {
-                            Section(section) {
-                                ForEach(rows) { SettingRow(s: $0, m: m) }
+                LauncherTabs(m: m) { t in
+                    if t.name == (m.tabs.contains { $0.name == "Game" } ? "Game" : m.tabs.first?.name) { CloudSavesSection() }
+                    if t.name == (m.tabs.contains { $0.name == "Diagnostics" } ? "Diagnostics" : m.tabs.last?.name) {
+                        Section {
+                            HStack {
+                                Text("Memory available")
+                                Spacer()
+                                Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
                             }
-                        }
-                    }
-                    Section {
-                        Button("Reset to tested defaults") { m.reset() }
-                            .disabled(!m.changed)
-                    } footer: {
-                        Text("Brings back all settings this game was tested with.")
-                    }
-                    CloudSavesSection()
-                    Section {
-                        HStack {
-                            Text("Memory available")
-                            Spacer()
-                            Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
+                        } footer: {
+                            Text(technical ? "os_proc_available_memory: what the app may still allocate before iOS ends it, every 2 seconds." : "How much more memory the game may use before iOS closes it.")
                         }
                     }
                 }
-                .listStyle(.insetGrouped)
-                .contentMargins(.horizontal, 12, for: .scrollContent)
                 .frame(width: geometry.size.width * 2 / 3)
             }
         }
@@ -172,7 +162,7 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
     let dir = getenv("DM_APP_DM").map { URL(fileURLWithPath: String(cString: $0)) } ?? Bundle.main.resourceURL?.appendingPathComponent("dm")
     guard let url = dir?.appendingPathComponent("launcher.json"), let data = try? Data(contentsOf: url) else { return false }
     guard let file = try? JSONDecoder().decode(SettingsFile.self, from: data), !file.settings.isEmpty else { fputs("[RED] launcher: dm/launcher.json cannot be read; starting the game\n", stderr); return false }
-    let model = LauncherModel(file.settings)
+    let model = LauncherModel(file.settings, tabs: file.tabs)
     gameMenuModel = model   // the in-game menu shows and saves the same choices (GameMenu.swift)
     if ProcessInfo.processInfo.environment["DM_LAUNCHER"] == "0" { fputs("launcher: off (DM_LAUNCHER=0)\n", stderr); model.applySaved(); return false }
     let parent = Unmanaged<UIViewController>.fromOpaque(viewController).takeUnretainedValue()

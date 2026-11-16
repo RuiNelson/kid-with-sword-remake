@@ -31,23 +31,28 @@ The exit code is 0 for a finished build, 1 for a build that stopped on an error 
 A built app carries the settings its game supports, as the iPhone app's settings screen shows them ([Settings](settings.md)): `dm/launcher.json` in the app inside an IPA, `Contents/Resources/dm/launcher.json` in a Mac app. The Mac app's list leaves out the settings only the iPhone app reads (the frame-rate counter, touch feedback). `dm/games/settings.py` writes it from `dm/games/settings.tsv`, whose header describes the rows. Breath of the Wild's Mac list, shortened:
 
 ```json
-{"schema": 1, "game": "01007EF00011E000", "settings": [
- {"env": "DM_FPS_TARGET", "kind": "choice", "section": "Game", "label": "Frame rate", "note": "…", "default": "60",
+{"schema": 1, "game": "01007EF00011E000",
+ "tabs": [{"name": "Picture", "icon": "photo", "about": "How sharp the picture is, …", "tech": "The size the 3D views render at, …"},
+          {"name": "Smoothness", "icon": "speedometer", "about": "…", "tech": "…"}],
+ "settings": [
+ {"env": "DM_RENDER_SCALE", "kind": "range", "section": "Picture", "label": "Render scale", "note": "…", "tech": "…", "default": "1.0", "min": 0.5, "max": 1.0, "step": 0.05, "level": "basic"},
+ {"env": "DM_FPS_TARGET", "kind": "choice", "section": "Smoothness", "label": "Frame rate", "note": "…", "tech": "…", "default": "60",
   "options": [["30", "30 fps"], ["60", "60 fps"]], "level": "basic"},
- {"env": "DM_RENDER_SCALE", "kind": "range", "section": "Game", "label": "Render scale", "note": "…", "default": "1.0", "min": 0.5, "max": 1.0, "step": 0.05},
- {"env": "DM_FPS_HOLD", "kind": "toggle", "section": "Performance", "label": "Hold frames when late", "note": "…", "default": "on", "on": "on", "off": "off"}
+ {"env": "DM_FPS_HOLD", "kind": "toggle", "section": "Smoothness", "label": "Hold frames when late", "note": "…", "tech": "…", "default": "on", "on": "on", "off": "off"}
 ]}
 ```
 
 - `env`: the environment switch the setting sets. `kind`: `choice` (one of `options`, each `[value, label]`), `range` (a number from `min` to `max` in `step`s) or `toggle` (`on` or `off`, the values the switch takes).
-- `section`: the heading the row goes under, today `Game`, `Controls` or `Performance`. Sections come in the order of their first rows, and rows in the order to show them. A new section may appear in schema 1: a reader draws a section it does not know like the others, under its name, as the iPhone app does.
+- `section`: the tab the row is on, today `Game`, `Picture`, `Smoothness`, `Controls`, `Performance` or `Diagnostics` (a front end without tabs draws them as headings). Sections come in the order of their first rows, and rows in the order to show them. A new section may appear in schema 1: a reader draws a section it does not know like the others, under its name, as the iPhone app does.
+- `tabs` (optional, top level): the tabs the rows use, in order, each `{"name", "icon", "about", "tech"}`: its name as `section` gives it, an SF Symbol, what its settings are for in plain words, and the same in technical terms. They come from `settings.py`'s `TABS`. A list written before tabs has none: draw each section as a tab or a heading under its name.
+- `note`: the line under the label, in plain words anyone can follow: what the setting does for the player, its cost, then the value recommended (`Recommended: …`). `tech` (optional): the technical description (how the host does it, the measurements behind the recommendation), which the launchers show while the player has **Technical details** on; it comes from `settings.tsv`'s `tech` column.
 - `default`: the value for this app's platform ([Tested defaults](settings.md#tested-defaults)), with profile defaults resolved for its game. A front end that keeps only the choices that differ from it lets a newer build's tested defaults reach the player, as the iPhone app does.
 - `base` (optional, render scale only): `{"docked": [w, h], "handheld": [w, h]}`, the 3D views' size that the scale multiplies, so a front end can show 0.75 as 1200×675 docked. It comes from the game's profile (`render_base`), and only some games have it.
 - `level` (optional): `basic` marks a setting to show first, for a front end that shows a short list and puts the rest behind a second step. Without it, the front end decides.
 - `needs` (optional): `<VAR>=<value>` makes the row a sub-setting of the row that sets `<VAR>`, drawn only while that row has that value (Rumble strength only while rumble is on). A row naming a variable the list does not have stays drawn.
 - An app without the file has no settings to offer: start it as it is.
 
-**Compatibility.** [launcher.schema.json](launcher.schema.json) describes the file as a JSON Schema, so a front end can check it and generate its types from it. `schema` is 1, and schema 1 grows only by optional fields: a reader ignores fields it does not know, draws sections it does not know, and a field never changes its meaning. A new `kind` would be schema 2, since a reader cannot draw a kind it does not know. A list written before the field existed has no `schema` and is 1. In `settings.tsv`, the optional fields come from the last column, `meta` (`key=value` pairs separated by `;`); a new key is added in `settings.py`'s `META`, here and in the schema together, and `test_launcher_settings.py` fails when the three disagree.
+**Compatibility.** [launcher.schema.json](launcher.schema.json) describes the file as a JSON Schema, so a front end can check it and generate its types from it. `schema` is 1, and schema 1 grows only by optional fields: a reader ignores fields it does not know, draws sections it does not know, and a field never changes its meaning. A new `kind` would be schema 2, since a reader cannot draw a kind it does not know. A list written before the field existed has no `schema` and is 1. In `settings.tsv`, the optional fields `level` and `needs` come from the last column, `meta` (`key=value` pairs separated by `;`); a new key is added in `settings.py`'s `META`, here and in the schema together, and `test_launcher_settings.py` fails when the three disagree.
 
 ## Starting a game
 

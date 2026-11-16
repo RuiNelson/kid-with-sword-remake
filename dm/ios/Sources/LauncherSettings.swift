@@ -1,12 +1,13 @@
-// Launcher settings, validation and persistence. Shared by the iOS UI, the Mac app's settings window (dm/mac/Launcher.swift) and the native storage regression test.
+// Launcher settings, their tabs, validation and persistence. Shared by the iOS UI, the Mac app's settings window (dm/mac/Launcher.swift) and the native storage regression test.
 import Foundation
 import Combine
 
 struct Setting: Decodable, Identifiable {
-    let env, kind, label, note, def: String
-    let section: String?   // heading on the settings screen; absent in older bundles
+    let env, kind, label, note, def: String   // note: the plain description under the label
+    let tech: String?      // the technical description, shown with Technical details on; absent in older bundles and for a setting without one
+    let section: String?   // the tab on the settings screen (SettingsFile.tabs); absent in older bundles
     let needs: String?     // "<VAR>=<value>": a sub-setting, drawn only while that setting has that value
-    let level: String?     // "basic": shown first (the Mac window's Basic settings); any other or none: Advanced settings. The iPhone keeps one list
+    let level: String?     // "basic": a setting a front end shows first (sections(basic:)); the launchers' tabs keep the list's order
     let base: Base?        // render scale: the 3D views' size at 1.0, docked and handheld, for the size in pixels (the Mac window)
     struct Base: Decodable { let docked, handheld: [Int] }
     let options: [[String]]?   // choice: [value, label]
@@ -32,9 +33,14 @@ struct Setting: Decodable, Identifiable {
         default: return true
         }
     }
-    enum CodingKeys: String, CodingKey { case env, kind, label, note, def = "default", section, needs, level, base, options, min, max, step, marks, on, off, sets }
+    enum CodingKeys: String, CodingKey { case env, kind, label, note, tech, def = "default", section, needs, level, base, options, min, max, step, marks, on, off, sets }
 }
-struct SettingsFile: Decodable { let settings: [Setting] }
+struct SettingsFile: Decodable { let settings: [Setting]; let tabs: [SettingsTab]? }   // tabs: absent in lists written before tabs
+/// One tab of the settings screen (settings.py TABS): its SF Symbol and two descriptions, plain and technical. A section the list has no tab for is drawn as a tab under its name
+struct SettingsTab: Decodable, Identifiable, Hashable {
+    let name, icon, about, tech: String
+    var id: String { name }
+}
 
 final class LauncherModel: ObservableObject {
     let settings: [Setting]
@@ -48,9 +54,12 @@ final class LauncherModel: ObservableObject {
 
     private let defaults: UserDefaults
 
-    init(_ settings: [Setting], defaults: UserDefaults = .standard) {
+    let tabInfo: [SettingsTab]
+
+    init(_ settings: [Setting], tabs: [SettingsTab]? = nil, defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.settings = settings
+        tabInfo = tabs ?? []
         let env = ProcessInfo.processInfo.environment
         fromLaunch = Set((env["DM_ENV_LAUNCH_KEYS"] ?? "").split(separator: " ").map(String.init))
         fixed = fromLaunch
@@ -91,7 +100,13 @@ final class LauncherModel: ObservableObject {
         return nil
     }
     func rows(in section: String) -> [Setting] { settings.filter { $0.sectionTitle == section && visible($0) } }
-    // The Mac window: Basic settings first, then Advanced settings, each in the list's sections and order
+    // The settings screen's tabs: one per section, in the list's order, with the list's icon and descriptions (a section without them: a generic icon, no description)
+    var tabs: [SettingsTab] {
+        sections.map { name in tabInfo.first { $0.name == name } ?? SettingsTab(name: name, icon: "slider.horizontal.3", about: "", tech: "") }
+    }
+    // A row the player moved away from its starting value (the game's tested default, or the env file's): what Reset to tested defaults is offered for
+    func isChanged(_ s: Setting) -> Bool { !fixed.contains(s.env) && !isBase(s, values[s.env] ?? base(s)) }
+    // A front end's short list (level basic) and the rest, each in the list's sections and order; the launchers themselves show tabs
     func sections(basic: Bool) -> [String] {
         settings.filter { $0.basic == basic }.reduce(into: []) { if !$0.contains($1.sectionTitle) { $0.append($1.sectionTitle) } }
     }
@@ -105,7 +120,7 @@ final class LauncherModel: ObservableObject {
         guard size.count == 2 else { return p }
         return "\(Int((Double(size[0]) * v).rounded())) × \(Int((Double(size[1]) * v).rounded())) (\(p))"
     }
-    var changed: Bool { settings.contains { !fixed.contains($0.env) && !isBase($0, values[$0.env] ?? base($0)) } }
+    var changed: Bool { settings.contains(where: isChanged) }
 
     // Reset every launcher choice to the game's defaults on the screen; values fixed by an env file or at launch stay. The saved choices are forgotten when Play applies
     // the defaults (apply() keeps no default), so Quit after Reset keeps them, and a choice a launch override hides is kept

@@ -1,4 +1,4 @@
-"""The launcher's settings (dm/games/settings.tsv through dm/games/settings.py): rows by graphics API and profile, single-screen sections, toggle values and the strict format;
+"""The launcher's settings (dm/games/settings.tsv through dm/games/settings.py): rows by graphics API and profile, the tabs with their descriptions, toggle values and the strict format;
 the meta column's optional fields, and the written list against docs/launcher.schema.json, the contract front ends read."""
 import importlib.util
 import json
@@ -15,7 +15,7 @@ settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
 
 BOTW, WONDER = '01007EF00011E000', '010015100B514000'
-PERFORMANCE_NVN = ['DM_FRAME_WG', 'DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
+PERFORMANCE_NVN = ['DM_FRAME_WG', 'DM_RT', 'DM_NVN_ENC_THREAD', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD']
 
 
 def build(gid, api, platform=None):
@@ -34,7 +34,8 @@ class LauncherSettingsTests(unittest.TestCase):
     def test_game_language_row_offers_the_games_own_or_every_language_when_unknown(self):
         self.assertNotIn('DM_LANG', rows_with_languages(['ja']))   # one language: nothing to pick
         s = rows_with_languages(['en-US', 'ja'])['DM_LANG']
-        self.assertEqual((s['options'], s['note']), ([['en-US', 'American English'], ['ja', 'Japanese']], ''))
+        self.assertEqual(s['options'], [['en-US', 'American English'], ['ja', 'Japanese']])
+        self.assertNotEqual(s['note'], settings.UNKNOWN_LANGUAGES)
         s = rows_with_languages([])['DM_LANG']   # no control data: a dump, a NUP without a NACP
         self.assertEqual(s['options'], [list(l) for l in settings.nacp.LANGUAGES])
         self.assertEqual((s['default'], s['note']), ('en-US', settings.UNKNOWN_LANGUAGES))
@@ -43,7 +44,7 @@ class LauncherSettingsTests(unittest.TestCase):
         for api, gid in [('nvn', BOTW), ('vulkan', '0100535012974000'), ('gl', '010014E00DB56000')]:
             with self.subTest(api=api):
                 s = build(gid, api)['DM_PRESENT_UPSCALE']
-                self.assertEqual((s['kind'], s['section'], s['default']), ('choice', 'Game', 'off'))
+                self.assertEqual((s['kind'], s['section'], s['default']), ('choice', 'Picture', 'off'))
                 self.assertEqual(s['options'], [['off', 'Standard'], ['metalfx', 'MetalFX']])
 
     def test_frame_buffering_by_graphics_api(self):
@@ -53,7 +54,7 @@ class LauncherSettingsTests(unittest.TestCase):
                 self.assertEqual('DM_PRESENT_SNAP' in rows, api == 'nvn')
                 if api == 'nvn':
                     s = rows['DM_PRESENT_SNAP']
-                    self.assertEqual((s['kind'], s['section'], s['default']), ('toggle', 'Performance', '1'))   # Breath of the Wild's profile: present_snap on
+                    self.assertEqual((s['kind'], s['section'], s['default']), ('toggle', 'Smoothness', '1'))   # Breath of the Wild's profile: present_snap on
                     self.assertIn('latency', s['note'])
 
     def test_sections_keep_the_profile_defaults(self):
@@ -62,7 +63,7 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual(botw['DM_PSO_MTL4']['default'], '1')   # pso_mtl4 on
         self.assertEqual((wonder['DM_PRESENT_SNAP']['default'], wonder['DM_PSO_MTL4']['default']), ('0', '0'))
         self.assertEqual((botw['DM_PSO_PREBUILD']['default'], botw['DM_NVN_ENC_THREAD']['default'], botw['DM_METAL_HUD']['default']), ('1', '1', '0'))   # the host's iOS defaults
-        self.assertEqual(list(dict.fromkeys(s['section'] for s in botw.values())), ['Game', 'Controls', 'Performance'])
+        self.assertEqual(list(dict.fromkeys(s['section'] for s in botw.values())), ['Game', 'Picture', 'Smoothness', 'Controls', 'Performance', 'Diagnostics'])
         self.assertNotIn('DM_FPS_HOLD', wonder)   # no frame step, as the Frame rate row
         self.assertIn('first start', botw['DM_PSO_PREBUILD']['note'])   # it runs once in the prepare step, before the first frame
 
@@ -109,9 +110,23 @@ class LauncherSettingsTests(unittest.TestCase):
             listed = settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
         rows = {s['env']: s for s in listed['settings']}
         self.assertEqual(listed['schema'], 1)
-        self.assertEqual([e for e, s in rows.items() if s.get('level') == 'basic'], ['DM_FPS_TARGET', 'DM_RENDER_SCALE', 'DM_OPMODE', 'DM_LANG', 'DM_RUMBLE'])
+        self.assertEqual([e for e, s in rows.items() if s.get('level') == 'basic'], ['DM_LANG', 'DM_OPMODE', 'DM_RENDER_SCALE', 'DM_FPS_TARGET', 'DM_RUMBLE'])
         self.assertEqual(rows['DM_RUMBLE_GAIN']['needs'], 'DM_RUMBLE=1')
         self.assertFalse({'level', 'needs'} & set(rows['DM_METAL_HUD']), 'a row without meta has no optional fields')
+        self.assertEqual([t['name'] for t in listed['tabs']], list(dict.fromkeys(s['section'] for s in listed['settings'])), 'the tabs the rows use, in their order')
+
+    def test_every_row_and_tab_has_a_plain_and_a_technical_description(self):
+        for platform in ('ios', 'mac'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(settings.nacp, 'languages', return_value=['en-US', 'ja']), patch.dict(os.environ, {'GFXAPI': 'nvn', 'SETTINGS_PLATFORM': platform}):
+                (Path(tmp) / 'main.fixups.tsv').write_text('# RENDER_SCALE\t1\n# DYNAMIC_RESOLUTION\t1\n# WIDE_VIEW\t1\n')
+                listed = settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
+            for s in listed['settings']:
+                self.assertTrue(s['note'] and s.get('tech'), f'{s["env"]}: a plain note and a technical description')
+                self.assertNotEqual(s['note'], s['tech'], s['env'])
+            for t in listed['tabs']:
+                self.assertTrue(t['icon'] and t['about'] and t['tech'], t['name'])
+        self.assertTrue(4 <= len(settings.TABS) <= 8, 'four to eight tabs')
 
     def test_meta_is_strict(self):
         self.assertEqual(settings.meta('level=basic; needs=DM_RUMBLE=1', 1), {'level': 'basic', 'needs': 'DM_RUMBLE=1'})
@@ -164,9 +179,9 @@ class LauncherSettingsTests(unittest.TestCase):
 
     def test_table_format_is_strict(self):
         good = 'DM_X\ttoggle\t-\t0\talways\tGame\tX\n'
-        for bad, why in [('DM_X\ttoggle\t-\t0\talways\tGame\tX\t\tlevel=basic\textra\n', 'columns'),
-                         ('DM_X\ttoggle\t-\t0\talways\tGame\tX\t\tneeds=DM_NOPE=1\n', 'no row sets'),
-                         ('DM_Y\ttoggle\t-\t0\talways\tGame\tY\t\tneeds=DM_X=on\n', 'never takes'),
+        for bad, why in [('DM_X\ttoggle\t-\t0\talways\tGame\tX\t\t\tlevel=basic\textra\n', 'columns'),
+                         ('DM_X\ttoggle\t-\t0\talways\tGame\tX\t\t\tneeds=DM_NOPE=1\n', 'no row sets'),
+                         ('DM_Y\ttoggle\t-\t0\talways\tGame\tY\t\t\tneeds=DM_X=on\n', 'never takes'),
                          ('DM_X\ttoggle\t-\t0\talways\tX\n', 'columns'), ('DM_X\ttoggle\t-\t0\talways\tsecret\tX\n', 'section'),
                          ('DM_X\ttoggle\ton\t0\talways\tGame\tX\n', 'toggle values'), ('DM_X\ttoggle\t-\t2\talways\tGame\tX\n', 'defaults to 0 or 1')]:
             with self.subTest(why=why), tempfile.TemporaryDirectory() as tmp:

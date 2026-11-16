@@ -10,7 +10,23 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / 'tools'))
 import game, nacp
 
-SECTIONS = ('Game', 'Controls', 'Performance')   # headings on the single settings screen
+# The settings screen's tabs, in the order shown: name: (SF Symbol, plain description, technical description). A row's section column names its tab; launcher.json carries the
+# tabs its rows use as "tabs" (docs/launcher.schema.json), so a front end shows the same icon and descriptions
+TABS = {
+    'Game': ('gamecontroller', 'The game itself: its language, whether it plays as on a TV or in your hands, and where your save is kept.',
+             'The system language and operation mode the host reports to the game (Horizon set and applet services), the Mac window mode, and the save folder the host syncs (save_sync).'),
+    'Picture': ('photo', 'How sharp the picture is, how it is enlarged to your screen, and its shape. A sharper picture costs more battery and heat.',
+                'The size the 3D views render at, the game\'s own dynamic resolution and upscaler, how the finished frame is scaled to the screen (linear or MetalFX), and its aspect and crop.'),
+    'Smoothness': ('speedometer', 'How many pictures a second you see, and what happens when the phone cannot keep up.',
+                   'The host\'s frame pacing target, MetalFX frame interpolation between game frames, the present buffer, and what the frame pacing does with a frame that misses its refresh.'),
+    'Controls': ('hand.tap', 'How the on-screen buttons look and feel, and how strongly the game vibrates.',
+                 'Haptics for the on-screen gamepad, its theme, and the gain and cutoff applied to the vibration amplitudes the game sends through hid.'),
+    'Performance': ('cpu', 'Helpers that keep the game fast and free of stutter. The tested defaults are a good start: change them only if the game stutters, runs hot or closes.',
+                    'Scheduling hints to iOS (an os_workgroup with frame deadlines, a time-constraint present thread), NVN encoding on its own thread, the Metal 4 pipeline archive and prebuild, conditional rendering, and the memory preset.'),
+    'Diagnostics': ('waveform.path.ecg', 'Counters and overlays that show how well the game runs. Leave them off while you play.',
+                    'The front end\'s frame counter and the Metal Performance HUD; on the iPhone, the memory the app may still use before iOS ends it (os_proc_available_memory).'),
+}
+SECTIONS = tuple(TABS)
 SCHEMA = 1   # launcher.json's version (docs/launcher.schema.json); it grows only by optional fields, so a reader of 1 reads every 1
 # The meta column's keys, each with the pattern its value must match. A key is added here, in docs/frontends.md and in
 # docs/launcher.schema.json together (test_launcher_settings.py checks that the three agree); a reader ignores keys it does not know
@@ -46,9 +62,9 @@ def rows():
     for n, line in enumerate((HERE / 'settings.tsv').read_text(encoding='utf-8').splitlines(), 1):
         if not line.strip() or line.startswith('#'): continue
         c = line.split('\t')
-        if len(c) not in (7, 8, 9): sys.exit(f'settings.tsv:{n}: 7 to 9 columns expected, {len(c)} found')
-        if c[5] not in SECTIONS: sys.exit(f'settings.tsv:{n}: unknown section: {c[5]}')
-        yield n, c + [''] * (9 - len(c))
+        if len(c) not in (7, 8, 9, 10): sys.exit(f'settings.tsv:{n}: 7 to 10 columns expected, {len(c)} found')
+        if c[5] not in SECTIONS: sys.exit(f'settings.tsv:{n}: unknown section: {c[5]} (tabs: {", ".join(SECTIONS)})')
+        yield n, c + [''] * (10 - len(c))
 
 
 def fixups_keys(path):   # '# KEY<TAB>value' header rows of a rewriter table
@@ -103,7 +119,7 @@ def build(gid, patched, control):
         return len(parts) == 1 or all(shown(c, n) for c in parts[1].split('&'))
 
     out, table, base = [], {r[1][0]: takes(r[1][1], r[1][2]) for r in rows()}, render_base(g)
-    for n, (var, kind, values, default, cond, section, label, note, extra) in rows():
+    for n, (var, kind, values, default, cond, section, label, note, tech, extra) in rows():
         m = meta(extra, n)
         if 'needs' in m:
             need, want = m['needs'].split('=', 1)
@@ -111,7 +127,7 @@ def build(gid, patched, control):
             can = table[need]
             if can is not None and want not in can: sys.exit(f'settings.tsv:{n}: needs a value {need} never takes: {want} (it takes {", ".join(sorted(can))})')
         if not shown(cond, n): continue
-        s = {'env': var, 'kind': kind, 'section': section, 'label': label, 'note': note, 'default': value(default, n), **m}
+        s = {'env': var, 'kind': kind, 'section': section, 'label': label, 'note': note, 'default': value(default, n), **({'tech': tech} if tech else {}), **m}
         if var == 'DM_PRESET': s['sets'] = macro('DM_GAME_POTATO', n).split(',')   # Potato's <VAR>=<value> list: the launcher locks those rows while Potato is picked
         if var == 'DM_RENDER_SCALE' and base: s['base'] = base   # the render scale in pixels, for the console mode chosen
         if var == 'DM_RENDER_SCALE':   # a game's own slider (game.tsv render_scale min:max:step, render_scale_default, render_scale_marks value=label,...)
@@ -144,7 +160,10 @@ def build(gid, patched, control):
             s.update(on=on_off[0], off=on_off[1], default=on_off[0] if s['default'] == '1' else on_off[1])   # the default as the value the variable takes
         else: sys.exit(f'settings.tsv:{n}: unknown kind {kind}')
         out.append(s)
-    return {'schema': SCHEMA, 'game': g.id, 'settings': out}
+    out.sort(key=lambda s: SECTIONS.index(s['section']))   # tabs in TABS order, rows in table order within each
+    used = list(dict.fromkeys(s['section'] for s in out))
+    tabs = [{'name': t, 'icon': TABS[t][0], 'about': TABS[t][1], 'tech': TABS[t][2]} for t in used]
+    return {'schema': SCHEMA, 'game': g.id, 'tabs': tabs, 'settings': out}
 
 
 if __name__ == '__main__':

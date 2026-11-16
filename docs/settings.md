@@ -1,6 +1,8 @@
 # Settings
 
-The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
+The screen before the game starts shows the settings the game supports, in tabs (a tab bar on the iPhone, a sidebar on the iPad and the Mac): **Game** (language, console mode, cloud saves), **Picture** (sharpness, upscaling, the picture's shape), **Smoothness** (frame rate, frame generation, frame buffering), **Controls** (touch controls, rumble), **Performance** (helpers against stutter, heat and memory) and **Diagnostics** (counters and the memory left). Each tab says at the top what its settings are for, and each setting says in plain words what it does, what it costs and what is recommended. Turn on **Technical details** on any tab to also see how each setting works inside the app. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices and the tab you had open for the next start. A Mac app shows the same tabs in a [window of its own](#the-mac-settings-window).
+
+The sections below describe each setting in more depth, grouped as Game, Controls and Performance; on the screen each is on the tab named above.
 
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Frame generation](#frame-generation), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
@@ -61,7 +63,7 @@ Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its worl
 
 - **When to change it:** turn it on if the picture looks soft and the device has GPU time to spare: on a Mac, or on an iPhone in handheld mode at 30 fps. For long sessions at 60 fps on an iPhone leave it at Standard.
 - **Cost:** more GPU time each frame, which can increase heat on an iPhone. [Breath of the Wild's measurements](../dm/games/01007EF00011E000/README.md#upscaling-current) cover Mac and iPhone; the matching iPhone Standard run and MetalFX's share of the thermal cost remain unmeasured. Nothing changes while the game's picture is as large as the screen. Unsupported devices and sizes use Standard scaling.
-- **On the Mac:** choose **MetalFX** under **Upscaling** in the [settings window](#the-mac-settings-window)'s Advanced settings, or set `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` (off by default). It helps in a large window or on a 4K screen.
+- **On the Mac:** choose **MetalFX** under **Upscaling** on the [settings window](#the-mac-settings-window)'s **Picture** tab, or set `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` (off by default). It helps in a large window or on a 4K screen.
 
 ### Game's upscaler
 
@@ -220,7 +222,7 @@ Sets every setting back to the game's tested default; **Play** then forgets your
 
 ## The Mac settings window
 
-A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Touch feedback** and **Picture** are only on the iPhone.
+A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. It has the same tabs, as a sidebar, with their descriptions, **Technical details** and **Reset to tested defaults** at the bottom of each tab; the window grows or shrinks to the open tab and remembers which one it was. **Display mode** is on the **Game** tab. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). **Touch feedback** and **Picture** are only on the iPhone.
 
 Click **Play** (or press Return) to start the game. **Quit**, ⌘Q or closing the window ends the app without the game. The app remembers your choices for that game, and a game started without the window, from a front end or with the window turned off, uses them too ([Saved choices](frontends.md#saved-choices)). A setting fixed by the program that started the app is shown greyed out; one an `env.txt` sets starts at the file's value and can still be changed.
 
