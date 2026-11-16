@@ -172,7 +172,6 @@ DM_NVN_GMEM_NOBIG	diagnostic
 DM_NVN_GMEM_SKIP	diagnostic	
 DM_NVN_GPUPROF	diagnostic	`=<f>`, `<f1>-<f2>` or `every:<n>`: logs the GPU start and duration of every encoder of those frames (`[gpuprof]` lines from Metal 4 counter heap timestamps)
 DM_NVN_GPUPROF_CS	diagnostic	
-DM_NVN_GPUW_RANGE	switch	`0` goes back to counting a whole pool as GPU-written at its first GPU write, so its uncompressed textures stop being taken from storage; by default only the storage ranges the GPU renders, copies, clears, downsamples or image-stores into count ([nvn-objects](reference/nvn-objects.md#uncompressed-storage-the-cpu-wrote-next-to-storage-the-gpu-writes))
 DM_NVN_GPU_TS	switch	`segment` or `submission`: what timestamp reports record (GPU start / end of the segment holding each report, or one time for the whole submission), instead of the profile's `gpu_timestamps`
 DM_NVN_HILITE	diagnostic	`=<fragment shader key>,…`: those draws use a solid colour instead (magenta, green, cyan, yellow, blue, white in order), to tell wrong geometry from wrong shading
 DM_NVN_INDLOG	diagnostic	`=<n>`: the first n indirect draws (and those of pass-dumped frames) log their arguments at encode and as the GPU left them once the submission completed, with the first indices
