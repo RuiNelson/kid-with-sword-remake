@@ -3,9 +3,12 @@
 # signing. A host change (dm/host, dm/gfx/nvn, dm/gfx/msl, ...) runs in the time make takes.
 #
 # By default it opens the Mac app's launcher with its settings window: a development app, <build>/dev/<the app's name>.app, made from the Mac app the full build packed (--platform mac-app)
-# beside the build folder. Its launcher (nxnative) and Info.plist are copies; its host is a link to dm/host/dmhost; its game files (romfs.img, msl, pso, romfs_overlay, the rewritten modules)
-# are links to the packed app's, and its profile tables links to the repository's. It has the packed app's bundle identifier, so the window shows the choices saved there. The launcher writes
-# the log to ~/Library/Logs/nxnative/<title ID>.log. --direct runs the host itself instead, as below.
+# beside the build folder. Its Info.plist is a copy; its host is a link to dm/host/dmhost; its game files (romfs.img, msl, pso, romfs_overlay, the rewritten modules) are links to the packed
+# app's, and its profile tables links to the repository's. Its launcher (nxnative) is the packed app's, or, once a launcher source (dm/mac/launcher.c, dm/mac/Launcher.swift, the iOS launcher's
+# LauncherSettings.swift and LauncherRow.swift, save_sync) is newer than it, one built here as pack_app.py builds it; its settings list (launcher.json) is the packed app's, or, once
+# dm/games/settings.py or settings.tsv is newer, one written here by settings.py with the packed app's graphics API, language and frame-rate counter default. So a launcher change runs at once too.
+# It has the packed app's bundle identifier, so the window shows the choices saved there. The launcher writes the log to ~/Library/Logs/nxnative/<title ID>.log. --direct runs the host itself
+# instead, as below.
 #
 # What it reuses from the game's build folder (<NSP folder>/<title ID>_build, made by build_ipa_from_nsp.py --platform mac or mac-app): the rewritten modules (patched_<version>), the
 # RomFS image and its game file replacements (extract/<version>), the Mac shader libraries of the current chain (shader/cache/b-<chain>.img), the pipeline archive made offline for this Mac
@@ -25,13 +28,17 @@
 #   --no-make: run the host as it is (dm/host/dmhost)
 #   --dry-run: build the host and print the command without running the game
 # Example: python3 scripts/dev_mac.py DM_FRAMEGEN=1 DM_FPS_TARGET=30 DM_UPSCALER=game
-import argparse, os, plistlib, re, shlex, shutil, subprocess, sys
+import argparse, json, os, plistlib, re, shlex, shutil, subprocess, sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / 'dm/mac')); sys.path.insert(0, str(REPO / 'dm/tools'))
+import pack_app   # the launcher's build (build_launcher, swift_sources, min_os)
+import nacp
 HOST = REPO / 'dm/host/dmhost'
 TABLES = ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv', 'cb_extent.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')   # the profile's, which the app carries (dm/mac/pack_app.py TABLES)
-LAUNCHER_INPUTS = ['dm/mac', 'dm/host/romfs_image.h', 'dm/host/save_sync.c', 'dm/host/save_sync.h', 'dm/ios/Launcher']   # what the packed app's launcher was built from
+LAUNCHER_INPUTS = ['dm/mac/launcher.c', 'dm/mac/Launcher.swift', 'dm/ios/Sources/LauncherSettings.swift', 'dm/ios/Sources/LauncherRow.swift',
+                   'dm/host/romfs_image.h', 'dm/host/save_sync.c', 'dm/host/save_sync.h']   # what the launcher is built from (pack_app.py build_launcher)
 SETTINGS_INPUTS = ['dm/games/settings.py', 'dm/games/settings.tsv']   # its launcher.json
 
 # Inputs of the stages this loop does not rerun, as paths in the repository (a folder: every file under it), with what is to be checked against
@@ -111,14 +118,61 @@ def copy_if_changed(src, dst):
     if not dst.is_file() or dst.stat().st_size != src.stat().st_size or dst.read_bytes() != src.read_bytes(): shutil.copy2(src, dst)
 
 
-def dev_app(build, gid, prof, app):
-    """<build>/dev/<app name>: the packed app's launcher and Info.plist (copies: the launcher's ad-hoc signature covers them), the current host, the app's game files and the repository's
-    profile tables as links. Made again in place each time: links cost nothing and the copies are small"""
+def newer(inputs, made):   # whether a file under these repository paths is newer than made (or made is missing)
+    m, f = newest([REPO / p for p in inputs])
+    return not made.is_file() or (f is not None and m > made.stat().st_mtime)
+
+
+def launcher(app, dev, dry):
+    """The dev app's launcher: the packed app's while no launcher source is newer than it; else one built here (pack_app.build_launcher, for the host's deployment target), again only when a
+    source is newer than the last one built. A built launcher stays until the packed app's is newer (a full build that packed a newer one)"""
+    packed, out, stamp = app / 'Contents/MacOS' / pack_app.EXE, dev / 'Contents/MacOS' / pack_app.EXE, dev.with_name(dev.name + '.launcher-built')   # beside the bundle, not in it
+    built = stamp.is_file() and out.is_file() and not out.is_symlink() and out.stat().st_mtime >= packed.stat().st_mtime
+    if not newer(LAUNCHER_INPUTS, packed) and not built:
+        copy_if_changed(packed, out); stamp.unlink(missing_ok=True); return
+    if built and not newer(LAUNCHER_INPUTS, out): return
+    if dry: say('the launcher sources are newer than the launcher: it would be built (dry run: not built)'); return
+    say('building the launcher (its sources are newer than the packed app\'s)')
+    run = lambda c: subprocess.run([str(x) for x in c], capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        clang, swiftc = Path(run(['xcrun', '--find', 'clang'])).resolve(), Path(run(['xcrun', '--find', 'swiftc']))   # swiftc not resolved, as pack_app.py
+        sdk = Path(run(['xcrun', '--sdk', 'macosx', '--show-sdk-path'])).resolve()
+    except (OSError, subprocess.CalledProcessError) as e: die(f'no Xcode compiler or macOS SDK: {e}')
+    if out.is_symlink() or out.exists(): out.unlink()
+    pack_app.build_launcher(out, pack_app.min_os(HOST if HOST.is_file() else packed), clang, swiftc, sdk)
+    stamp.write_text('')
+
+
+def settings_list(app, dev, gid, patched, ext, dry):
+    """The dev app's launcher.json: a link to the packed app's while settings.py and settings.tsv are not newer than it; else written here by settings.py (SETTINGS_PLATFORM=mac) with what the
+    full build gave it: the graphics API (the packed shader library: b-<chain> is NVN, vk Vulkan, gl GL), the language (Info.plist DMLanguage) and the frame-rate counter's default (the packed list's)"""
+    packed, out = app / 'Contents/Resources/dm/launcher.json', dev / 'Contents/Resources/dm/launcher.json'
+    if not packed.is_file(): return
+    if not newer(SETTINGS_INPUTS, packed): link(out, packed); return
+    if out.is_file() and not out.is_symlink() and not newer(SETTINGS_INPUTS + ['scripts/dev_mac.py'], out) and out.stat().st_mtime >= packed.stat().st_mtime: return
+    libs = [p.name for p in (app / 'Contents/Resources/msl').iterdir()] if (app / 'Contents/Resources/msl').is_dir() else []
+    gfx = 'vulkan' if 'vk' in libs else 'gl' if 'gl' in libs else 'nvn'
+    info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+    old = {s['env']: s for s in json.loads(packed.read_text(encoding='utf-8')).get('settings', [])}
+    fps = old.get('DM_SHOW_FPS', {}); fps = '1' if fps and fps.get('default') == fps.get('on', '1') else '0'
+    controls = [ext / 'control.nacp'] + sorted(p for p in ext.parent.glob('*/control.nacp') if p != ext / 'control.nacp')   # the packed version's, then the others' (a NUP's update may carry none)
+    control = next((p for p in controls if p.is_file() and nacp.languages(p)), controls[0])
+    if dry: say(f'the launcher settings are newer than the packed app\'s list: launcher.json would be written (GFXAPI={gfx}, dry run: not written)'); return
+    say(f'writing the launcher settings (settings.py: GFXAPI={gfx}, DM_LANG={info.get("DMLanguage", "")}, {control.relative_to(ext.parent.parent)})')
+    if out.is_symlink(): out.unlink()
+    env = {**os.environ, 'GFXAPI': gfx, 'SETTINGS_PLATFORM': 'mac', 'DM_LANG': str(info.get('DMLanguage', '')), 'DM_SHOW_FPS': fps}
+    r = subprocess.run([sys.executable, str(REPO / 'dm/games/settings.py'), gid, str(patched), str(control), str(out)], env=env, capture_output=True, text=True)
+    if r.returncode: die(f'settings.py failed: {(r.stderr or r.stdout).strip()[-1500:]}')
+
+
+def dev_app(build, gid, prof, app, patched, ext, dry):
+    """<build>/dev/<app name>: the packed app's Info.plist (a copy), the current host, the app's game files and the repository's profile tables as links, and the launcher and its settings list,
+    the packed app's or built here from newer sources (launcher, settings_list). Made again in place each time: links cost nothing and the copies are small"""
     dev = build / 'dev' / app.name; c = dev / 'Contents'
     for d in (c / 'MacOS', c / 'Resources/dm'): d.mkdir(parents=True, exist_ok=True)
     copy_if_changed(app / 'Contents/Info.plist', c / 'Info.plist')
     if (app / 'Contents/PkgInfo').is_file(): copy_if_changed(app / 'Contents/PkgInfo', c / 'PkgInfo')
-    copy_if_changed(app / 'Contents/MacOS/nxnative', c / 'MacOS/nxnative')
+    launcher(app, dev, dry)
     link(c / 'MacOS/dmhost', HOST)
     res, dm = app / 'Contents/Resources', c / 'Resources/dm'
     want = {p.name for p in res.iterdir() if p.name != 'dm'}
@@ -128,9 +182,8 @@ def dev_app(build, gid, prof, app):
     want = {p.name for p in (res / 'dm').iterdir()}
     for p in dm.iterdir():
         if p.name not in want: p.unlink() if p.is_symlink() or p.is_file() else shutil.rmtree(p)
-    for n in want: link(dm / n, prof / n if n in TABLES and (prof / n).is_file() else res / 'dm' / n)
-    stale('launcher', [REPO / p for p in LAUNCHER_INPUTS], app / 'Contents/MacOS/nxnative', 'mac-app')
-    stale('launcher settings (launcher.json)', [REPO / p for p in SETTINGS_INPUTS], res / 'dm/launcher.json', 'mac-app')
+    for n in want - {'launcher.json'}: link(dm / n, prof / n if n in TABLES and (prof / n).is_file() else res / 'dm' / n)
+    settings_list(app, dev, gid, patched, ext, dry)
     return dev
 
 
@@ -178,7 +231,7 @@ def main():
     if not a.direct:   # the launcher, with its settings window
         app = packed_app(build, gid)
         if not app: die(f'no Mac app of {gid} beside {build}: run scripts/build_ipa_from_nsp.py --platform mac-app once (or use --direct)')
-        dev = dev_app(build, gid, prof, app)
+        dev = dev_app(build, gid, prof, app, patched, ext, a.dry_run)
         env = dict(env_file(a.env_file)) if a.env_file else {}
         env.update(dict(v.split('=', 1) for v in a.vars))
         exe = dev / 'Contents/MacOS/nxnative'; args = [str(exe)] + (['--no-launcher'] if a.no_launcher else [])
