@@ -100,37 +100,34 @@ private struct LauncherView: View {
     @AppStorage("window.technical") private var technical = false
 
     var body: some View {
-        GeometryReader { geometry in
-            HStack(spacing: 0) {
-                VStack(spacing: 16) {
-                    if let icon = appIcon() {
-                        Image(uiImage: icon).resizable().frame(width: 96, height: 96)
-                            .clipShape(RoundedRectangle(cornerRadius: 22))
-                            .accessibilityHidden(true)
-                    }
-                    Text((info("CFBundleDisplayName") as? String) ?? "Game")
-                        .font(.title.weight(.bold)).multilineTextAlignment(.center)
-                    Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
-                        .font(.callout).foregroundStyle(.secondary)
-                    playButton
+        LauncherTabs(m: m) {
+            VStack(spacing: 8) {
+                if let icon = appIcon() {
+                    Image(uiImage: icon).resizable().frame(width: 96, height: 96)
+                        .clipShape(RoundedRectangle(cornerRadius: 22))
+                        .accessibilityHidden(true)
                 }
-                .padding(16)
-                .frame(width: geometry.size.width / 3, height: geometry.size.height)
-                LauncherTabs(m: m) { t in
-                    if t.name == (m.tabs.contains { $0.name == "Game" } ? "Game" : m.tabs.first?.name) { CloudSavesSection() }
-                    if t.name == (m.tabs.contains { $0.name == "Diagnostics" } ? "Diagnostics" : m.tabs.last?.name) {
-                        Section {
-                            HStack {
-                                Text("Memory available")
-                                Spacer()
-                                Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
-                            }
-                        } footer: {
-                            Text(technical ? "os_proc_available_memory: what the app may still allocate before iOS ends it, every 2 seconds." : "How much more memory the game may use before iOS closes it.")
-                        }
+                Text((info("CFBundleDisplayName") as? String) ?? "Game")
+                    .font(.title.weight(.bold)).multilineTextAlignment(.center)
+                Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .listRowBackground(Color.clear)
+        } bar: {
+            playButton.padding(.horizontal, 16).padding(.vertical, 8).frame(maxWidth: .infinity)
+        } extra: { t in
+            if t.name == (m.tabs.contains { $0.name == "Game" } ? "Game" : m.tabs.first?.name) { CloudSavesSection() }
+            if t.name == (m.tabs.contains { $0.name == "Diagnostics" } ? "Diagnostics" : m.tabs.last?.name) {
+                Section {
+                    HStack {
+                        Text("Memory available")
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(memory), countStyle: .memory)).monospacedDigit().foregroundStyle(.secondary)
                     }
+                } footer: {
+                    Text(technical ? "os_proc_available_memory: what the app may still allocate before iOS ends it, every 2 seconds." : "How much more memory the game may use before iOS closes it.")
                 }
-                .frame(width: geometry.size.width * 2 / 3)
             }
         }
         .preferredColorScheme(.dark)
@@ -175,6 +172,7 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
     }
     let h = DmHostingController(rootView: view)
     h.modalPresentationStyle = .fullScreen
+    h.overrideUserInterfaceStyle = .dark   // a TabView does not pass preferredColorScheme up to its hosting controller
     host = h
     parent.present(h, animated: false)
     fputs("launcher: \(file.settings.count) settings shown\n", stderr)

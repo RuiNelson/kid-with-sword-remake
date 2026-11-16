@@ -16,7 +16,7 @@ struct LauncherView: View {
     @AppStorage("window.show") private var show = true
 
     var body: some View {
-        VStack(spacing: 0) {
+        LauncherTabs(m: m) {
             HStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
@@ -25,11 +25,7 @@ struct LauncherView: View {
                 }
                 Spacer()
             }
-            .padding([.horizontal, .top], 20)
-            LauncherTabs(m: m) { t in
-                if t.name == (m.tabs.contains { $0.name == "Game" } ? "Game" : m.tabs.first?.name) { CloudSavesSection() }
-            }
-            .padding(.top, 12)
+        } bar: {
             HStack {
                 Toggle("Show this window at launch", isOn: $show).toggleStyle(.checkbox)
                 Spacer()
@@ -37,10 +33,12 @@ struct LauncherView: View {
                 Button("Play") { done(true) }.keyboardShortcut(.defaultAction)
             }
             .padding(20)
+            .background(.bar)
+        } extra: { t in
+            if t.name == (m.tabs.contains { $0.name == "Game" } ? "Game" : m.tabs.first?.name) { CloudSavesSection() }
         }
         .frame(minWidth: 720, idealWidth: 780, minHeight: 480, idealHeight: 640)
     }
-
 }
 
 /// Cloud saves: a folder the save is synced through (dm/host/save_sync.h), the one the iPhone app picks in its launcher's Cloud saves section. It is kept in this app's

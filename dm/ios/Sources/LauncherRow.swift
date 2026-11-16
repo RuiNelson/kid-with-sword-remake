@@ -76,33 +76,81 @@ private struct TechLabelStyle: LabelStyle {
     }
 }
 
-/// The settings screen's tabs: SwiftUI's TabView, one tab per section of the list with its icon, the tab last open kept in window.tab. Each tab is a grouped list of its header, its rows,
+/// The settings screen's sections: on a wide screen SwiftUI's TabView (sidebarAdaptable); on the iPhone a list of them that opens each one's page. TabView, one tab per section of the list with its icon, the tab last open kept in window.tab. Each tab is a grouped list of its header, its rows,
 /// what the launcher adds to it (extra: cloud saves, the memory left), and Reset to tested defaults
-struct LauncherTabs<Extra: View>: View {
+struct LauncherTabs<Intro: View, Bar: View, Extra: View>: View {
     @ObservedObject var m: LauncherModel
+    /// the app's icon, name and version: the top of the first tab
+    @ViewBuilder let intro: Intro
+    /// Play (and whatever goes beside it): pinned at the bottom of every tab
+    @ViewBuilder let bar: Bar
     @ViewBuilder let extra: (SettingsTab) -> Extra
     @AppStorage("window.tab") private var tab = ""   // the tab last open; the first one on the first start
 
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var path: [String] = []
+
     var body: some View {
+        if sizeClass == .compact { sectionList } else { tabs }
+    }
+
+    /// Wide screens (iPad, Mac): a sidebar of the sections beside the open one
+    private var tabs: some View {
         TabView(selection: Binding(get: { m.tabs.contains { $0.name == tab } ? tab : m.tabs.first?.name ?? "" }, set: { tab = $0 })) {
             ForEach(m.tabs) { t in
                 Tab(t.name, systemImage: t.icon, value: t.name) {
-                    Form {
-                        LauncherTabHeader(tab: t)
-                        let rows = m.rows(in: t.name)
-                        if !rows.isEmpty {
-                            Section("Settings") {
-                                ForEach(rows) { SettingRow(s: $0, m: m) }
-                            }
-                        }
-                        extra(t)
-                        LauncherResetSection(m: m)
-                    }
-                    .formStyle(.grouped)
+                    tabForm(t).safeAreaInset(edge: .bottom, spacing: 0) { bar }
                 }
             }
         }
         .tabViewStyle(.sidebarAdaptable)
+    }
+
+    /// The iPhone: the sections as a list, a tap on one opens its page (a stack, as the sidebar collapses on a narrow screen)
+    private var sectionList: some View {
+        NavigationStack(path: $path) {
+            Form {
+                Section { intro }
+                Section {
+                    ForEach(m.tabs) { t in
+                        NavigationLink(value: t.name) { Label(t.name, systemImage: t.icon) }
+                    }
+                }
+                LauncherResetSection(m: m)
+            }
+            .formStyle(.grouped)
+            .safeAreaInset(edge: .bottom, spacing: 0) { bar }
+            .navigationDestination(for: String.self) { name in
+                if let t = m.tabs.first(where: { $0.name == name }) {
+                    detail(t)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func detail(_ t: SettingsTab) -> some View {
+        let page = tabForm(t, intro: false).navigationTitle(t.name).safeAreaInset(edge: .bottom, spacing: 0) { bar }
+        #if os(iOS)
+        page.navigationBarTitleDisplayMode(.inline)
+        #else
+        page
+        #endif
+    }
+
+    private func tabForm(_ t: SettingsTab, intro showIntro: Bool = true) -> some View {
+        Form {
+            if showIntro && t.name == m.tabs.first?.name { Section { intro } }
+            LauncherTabHeader(tab: t)
+            let rows = m.rows(in: t.name)
+            if !rows.isEmpty {
+                Section("Settings") {
+                    ForEach(rows) { SettingRow(s: $0, m: m) }
+                }
+            }
+            extra(t)
+            LauncherResetSection(m: m)
+        }
+        .formStyle(.grouped)
     }
 }
 
